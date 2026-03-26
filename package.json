@@ -1,0 +1,19 @@
+{
+  "name": "claude-discord-hub",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "bot": "bun bot.ts",
+    "channel": "bun channel.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0",
+    "discord.js": "^14.25.1"
+  }
+}
