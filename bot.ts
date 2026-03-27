@@ -347,11 +347,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 
     pendingPermissions.delete(requestId)
 
-    const emoji = behavior === 'allow' ? '✅' : '❌'
-    await interaction.update({
-      content: `${emoji} ${behavior === 'allow' ? 'Allowed' : 'Denied'} by ${interaction.user.username}`,
-      components: [],
-    })
+    await interaction.message.delete().catch(() => {})
+    await interaction.deferUpdate().catch(() => {})
   } catch {
     await interaction.reply({ content: 'Failed to relay permission decision.', ephemeral: true })
   }
