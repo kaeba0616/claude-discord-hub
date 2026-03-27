@@ -72,26 +72,44 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 레포 폴더가 없으면 자동 생성됩니다.
 
+### 기존 세션 이어서 연결 (Discord에서)
+
+세션 ID를 알고 있다면 `!add` 시 바로 resume 가능:
+```
+!add myproject ~/dev/myproject <session-id>
+```
+
+세션 ID를 모르면 먼저 연결 후 찾기:
+```
+!add myproject ~/dev/myproject       # 일단 새 세션으로 연결
+!sessions                            # 기존 세션 목록에서 ID 확인
+!stop                                # 새 세션 중지
+!resume <id>                         # 원하는 기존 세션으로 전환
+```
+
 ### 새 프로젝트 연결 (터미널에서)
 
 ```bash
 # 채널 ID 확인: Discord 설정 > 고급 > 개발자 모드 → 채널 우클릭 > 채널 ID 복사
 ./claude-sessions.sh add myproject ~/dev/myproject <channel-id>
 ./claude-sessions.sh start myproject
+
+# 기존 세션 이어서
+./claude-sessions.sh start myproject --resume "<session-id>"
 ```
 
 ### 세션 중지/삭제 (Discord에서)
 
-```
-!stop              # 세션 중지 (나중에 재시작 가능)
-!remove            # 세션 완전 삭제
-```
+- `!stop` — 세션 중지 (설정 유지, `!start`로 재시작 가능)
+- `!remove` — 세션 종료 + 채널 연결 설정 삭제 (다시 쓰려면 `!add`부터)
+
+둘 다 레포 폴더와 코드는 건드리지 않습니다.
 
 ### 이전 세션 이어서 하기
 
 ```
 !last              # 가장 최근 세션 ID 확인
-!sessions          # 최근 5개 세션 목록
+!sessions          # 최근 5개 세션 목록 (현재 채널 레포만)
 !resume <id>       # 이전 대화 이어서 시작
 ```
 
@@ -106,7 +124,7 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 | 명령어 | 설명 |
 |--------|------|
-| `!add <name> <repo-path>` | 현재 채널을 레포에 연결 + 세션 시작 |
+| `!add <name> <repo-path> [session-id]` | 채널을 레포에 연결 (세션 ID로 resume 가능) |
 | `!remove` | 현재 채널의 세션 삭제 |
 | `!start` | 세션 시작 |
 | `!stop` | 세션 중지 |

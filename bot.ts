@@ -175,18 +175,21 @@ async function handleCommand(msg: Message) {
     case 'add': {
       const name = args[0]
       const repoPath = args[1]
+      const sessionId = args[2] // optional: resume existing session
       if (!name || !repoPath) {
-        await msg.reply('Usage: `!add <name> <repo-path>`')
+        await msg.reply('Usage: `!add <name> <repo-path> [session-id]`')
         return
       }
       try {
-        const addOut = execSync(`${SCRIPT_PATH} add ${name} ${repoPath} ${msg.channelId}`, {
+        execSync(`${SCRIPT_PATH} add ${name} ${repoPath} ${msg.channelId}`, {
           encoding: 'utf8',
           timeout: 5000,
         })
-        execSync(`${SCRIPT_PATH} start ${name}`, { encoding: 'utf8', timeout: 15000 })
+        const resumeFlag = sessionId ? `--resume ${sessionId}` : ''
+        execSync(`${SCRIPT_PATH} start ${name} ${resumeFlag}`, { encoding: 'utf8', timeout: 15000 })
         reloadRoutes()
-        await msg.reply(`✅ Session **${name}** created and started.\nRepo: \`${repoPath}\``)
+        const resumeMsg = sessionId ? `\nResuming: \`${sessionId}\`` : ''
+        await msg.reply(`✅ Session **${name}** created and started.\nRepo: \`${repoPath}\`${resumeMsg}`)
       } catch (err) {
         const errMsg = err instanceof Error ? (err as any).stderr || err.message : String(err)
         await msg.reply(`❌ Failed: ${errMsg.replace(/\x1b\[[0-9;]*m/g, '').slice(0, 500)}`)
@@ -296,7 +299,7 @@ async function handleCommand(msg: Message) {
       await msg.reply(
         [
           '**Claude Hub Commands**',
-          '`!add <name> <repo-path>` — Link this channel to a repo + start session',
+          '`!add <name> <repo-path> [session-id]` — Link channel to repo (optionally resume session)',
           '`!remove` — Remove this channel\'s session',
           '`!start` — Start this channel\'s session',
           '`!stop` — Stop this channel\'s session',
