@@ -173,6 +173,11 @@ async function handleCommand(msg: Message) {
     }
 
     case 'add': {
+      const existingRoute = routes.get(msg.channelId)
+      if (existingRoute) {
+        await msg.reply(`This channel is already linked to session **${existingRoute.name}**. Use \`!remove\` first.`)
+        return
+      }
       const name = args[0]
       const repoPath = args[1]
       const sessionId = args[2] // optional: resume existing session

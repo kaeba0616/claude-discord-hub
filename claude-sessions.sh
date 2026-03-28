@@ -73,6 +73,21 @@ next_port() {
     echo $((max_port + 1))
 }
 
+# Check if a channel ID is already used by another session
+channel_in_use() {
+    local cid="$1"
+    shopt -s nullglob
+    for f in "$SESSIONS_DIR"/*.conf; do
+        if grep -q "^channel_id=$cid$" "$f"; then
+            basename "$f" .conf
+            shopt -u nullglob
+            return 0
+        fi
+    done
+    shopt -u nullglob
+    return 1
+}
+
 # ─── ADD ────────────────────────────────────────────────────────────────────
 cmd_add() {
     local name="${1:?Usage: $0 add <name> <repo-path> <channel-id>}"
@@ -81,6 +96,12 @@ cmd_add() {
 
     if session_exists "$name"; then
         echo -e "${RED}Session '$name' already exists. Use 'remove' first.${NC}"
+        exit 1
+    fi
+
+    local existing
+    if existing=$(channel_in_use "$channel_id"); then
+        echo -e "${RED}Channel already linked to session '$existing'. Use 'remove' first.${NC}"
         exit 1
     fi
 
