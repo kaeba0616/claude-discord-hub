@@ -495,6 +495,40 @@ function splitMessage(text: string, limit: number): string[] {
   return chunks
 }
 
+// ─── Resilience ───────────────────────────────────────────────────────────
+
+client.on('error', (err) => {
+  console.error(`[Discord] Client error: ${err.message}`)
+})
+
+client.on('warn', (msg) => {
+  console.warn(`[Discord] Warning: ${msg}`)
+})
+
+client.on('shardError', (err, shardId) => {
+  console.error(`[Discord] Shard ${shardId} error: ${err.message}`)
+})
+
+client.on('shardDisconnect', (event, shardId) => {
+  console.warn(`[Discord] Shard ${shardId} disconnected (code ${event.code}). Auto-reconnecting...`)
+})
+
+client.on('shardReconnecting', (shardId) => {
+  console.log(`[Discord] Shard ${shardId} reconnecting...`)
+})
+
+client.on('shardResume', (shardId, replayedEvents) => {
+  console.log(`[Discord] Shard ${shardId} resumed. Replayed ${replayedEvents} events.`)
+})
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[Process] Unhandled rejection:', reason)
+})
+
+process.on('uncaughtException', (err) => {
+  console.error('[Process] Uncaught exception:', err)
+})
+
 // ─── Start ─────────────────────────────────────────────────────────────────
 
 const token = loadBotToken()
@@ -509,4 +543,13 @@ client.once('ready', () => {
   console.log(`Routes: ${routes.size} sessions`)
 })
 
-await client.login(token)
+async function startBot() {
+  try {
+    await client.login(token)
+  } catch (err) {
+    console.error(`[Bot] Login failed: ${err}. Retrying in 30s...`)
+    setTimeout(startBot, 30_000)
+  }
+}
+
+await startBot()

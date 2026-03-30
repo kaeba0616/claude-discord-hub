@@ -262,35 +262,38 @@ cmd_stop() {
 
 # ─── BOT ────────────────────────────────────────────────────────────────────
 cmd_bot() {
-    local action="${1:?Usage: $0 bot <start|stop|status>}"
+    local action="${1:?Usage: $0 bot <start|stop|status|logs>}"
 
     case "$action" in
         start)
-            if tmux has-session -t "$BOT_TMUX" 2>/dev/null; then
+            if systemctl --user is-active --quiet discord-bot; then
                 echo -e "${YELLOW}Bot is already running.${NC}"
                 return
             fi
-            tmux new-session -d -s "$BOT_TMUX" -c "$SCRIPT_DIR" \
-                "bun bot.ts; echo 'Bot ended. Press Enter to close.'; read"
-            echo -e "${GREEN}Bot started (tmux: $BOT_TMUX)${NC}"
+            systemctl --user start discord-bot
+            echo -e "${GREEN}Bot started (systemd: discord-bot)${NC}"
             ;;
         stop)
-            if ! tmux has-session -t "$BOT_TMUX" 2>/dev/null; then
+            if ! systemctl --user is-active --quiet discord-bot; then
                 echo -e "${YELLOW}Bot is not running.${NC}"
                 return
             fi
-            tmux kill-session -t "$BOT_TMUX"
+            systemctl --user stop discord-bot
             echo -e "${GREEN}Bot stopped.${NC}"
             ;;
         status)
-            if tmux has-session -t "$BOT_TMUX" 2>/dev/null; then
-                echo -e "${GREEN}Bot is running (tmux: $BOT_TMUX)${NC}"
+            if systemctl --user is-active --quiet discord-bot; then
+                echo -e "${GREEN}Bot is running (systemd: discord-bot)${NC}"
+                systemctl --user status discord-bot --no-pager -l | tail -5
             else
                 echo -e "${RED}Bot is not running.${NC}"
             fi
             ;;
+        logs)
+            journalctl --user -u discord-bot -f --no-pager
+            ;;
         *)
-            echo -e "${RED}Usage: $0 bot <start|stop|status>${NC}"
+            echo -e "${RED}Usage: $0 bot <start|stop|status|logs>${NC}"
             exit 1
             ;;
     esac
