@@ -136,15 +136,15 @@ EOF
 
 # ─── START ──────────────────────────────────────────────────────────────────
 cmd_start() {
-    local name="${1:?Usage: $0 start <name> [--resume <session-id>]}"
+    local name="${1:?Usage: $0 start <name> [-c|--continue]}"
     shift
     local resume_arg=""
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --resume|-r)
-                resume_arg="--resume '${2:?Missing session ID for --resume}'"
-                shift 2
+            -c|--continue)
+                resume_arg="-c"
+                shift
                 ;;
             *)
                 echo -e "${RED}Unknown option: $1${NC}"
@@ -237,7 +237,7 @@ EOF
     echo -e "${GREEN}Started session '$name'${NC}"
     echo -e "  tmux: ${CYAN}$tmux_name${NC}  port: ${CYAN}$port${NC}  repo: $repo_path"
     if [[ -n "$resume_arg" ]]; then
-        echo -e "  Resuming: ${CYAN}${resume_arg}${NC}"
+        echo -e "  Continuing last conversation (${CYAN}claude -c${NC})"
     fi
 }
 
@@ -418,8 +418,8 @@ Usage: claude-sessions.sh <command> [args]
 Session Commands:
   add <name> <repo-path> <channel-id>
                       Register a new repo (port auto-assigned)
-  start <name> [--resume <id>]
-                      Start a Claude Code session
+  start <name> [-c|--continue]
+                      Start a Claude Code session (-c continues last)
   stop <name>         Stop a running session
   start-all           Start bot + all sessions
   stop-all            Stop all sessions + bot
@@ -438,8 +438,8 @@ Examples:
   claude-sessions.sh add myproject ~/dev/myproject 846209781206941736
   claude-sessions.sh start myproject
 
-  # Resume a previous session
-  claude-sessions.sh start myproject --resume "session-id"
+  # Continue the most recent session
+  claude-sessions.sh start myproject -c
 
   # Start everything
   claude-sessions.sh start-all

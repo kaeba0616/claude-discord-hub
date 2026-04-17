@@ -155,17 +155,12 @@ async function handleCommand(msg: Message) {
         await msg.reply('This channel is not linked to a session.')
         return
       }
-      const sessionId = args[0]
-      if (!sessionId) {
-        await msg.reply('Usage: `!resume <session-id>`')
-        return
-      }
       try {
-        execSync(`${SCRIPT_PATH} start ${route.name} --resume ${sessionId}`, {
+        execSync(`${SCRIPT_PATH} start ${route.name} -c`, {
           encoding: 'utf8',
           timeout: 10000,
         })
-        await msg.reply(`✅ Session **${route.name}** resumed (${sessionId}).`)
+        await msg.reply(`✅ Session **${route.name}** resumed (claude -c).`)
       } catch {
         await msg.reply(`❌ Failed to resume session **${route.name}**.`)
       }
@@ -180,9 +175,9 @@ async function handleCommand(msg: Message) {
       }
       const name = args[0]
       const repoPath = args[1]
-      const sessionId = args[2] // optional: resume existing session
+      const continueFlag = args[2] === '-c' || args[2] === 'resume'
       if (!name || !repoPath) {
-        await msg.reply('Usage: `!add <name> <repo-path> [session-id]`')
+        await msg.reply('Usage: `!add <name> <repo-path> [-c]`')
         return
       }
       try {
@@ -190,10 +185,10 @@ async function handleCommand(msg: Message) {
           encoding: 'utf8',
           timeout: 5000,
         })
-        const resumeFlag = sessionId ? `--resume ${sessionId}` : ''
-        execSync(`${SCRIPT_PATH} start ${name} ${resumeFlag}`, { encoding: 'utf8', timeout: 15000 })
+        const startArgs = continueFlag ? '-c' : ''
+        execSync(`${SCRIPT_PATH} start ${name} ${startArgs}`, { encoding: 'utf8', timeout: 15000 })
         reloadRoutes()
-        const resumeMsg = sessionId ? `\nResuming: \`${sessionId}\`` : ''
+        const resumeMsg = continueFlag ? `\nContinuing last session (\`claude -c\`)` : ''
         await msg.reply(`✅ Session **${name}** created and started.\nRepo: \`${repoPath}\`${resumeMsg}`)
       } catch (err) {
         const errMsg = err instanceof Error ? (err as any).stderr || err.message : String(err)
@@ -240,7 +235,7 @@ async function handleCommand(msg: Message) {
           const [ts, id, name] = output.trim().split(' | ').map(s => s.trim())
           const label = name ? ` (${name})` : ''
           const date = ts ? ts.replace('T', ' ').slice(0, 16) : '?'
-          await msg.reply(`**Latest session${label}:**\n\`${date}\` \`${id}\`\n\nResume: \`!resume ${id}\``)
+          await msg.reply(`**Latest session${label}:**\n\`${date}\` \`${id}\`\n\nResume (continues last): \`!resume\``)
         }
       } catch {
         await msg.reply('Failed to find sessions.')
@@ -275,7 +270,7 @@ async function handleCommand(msg: Message) {
             const date = ts ? ts.replace('T', ' ').slice(0, 16) : '?'
             return `\`${date}\` ${label}\`${id}\``
           })
-          await msg.reply(`**Recent sessions for ${route.name}** (\`${route.repoPath}\`):\n${lines.join('\n')}\n\nUse \`!resume <id>\` to resume.`)
+          await msg.reply(`**Recent sessions for ${route.name}** (\`${route.repoPath}\`):\n${lines.join('\n')}\n\nUse \`!resume\` to continue the latest.`)
         }
       } catch {
         await msg.reply('Failed to list sessions.')
@@ -304,13 +299,13 @@ async function handleCommand(msg: Message) {
       await msg.reply(
         [
           '**Claude Hub Commands**',
-          '`!add <name> <repo-path> [session-id]` — Link channel to repo (optionally resume session)',
+          '`!add <name> <repo-path> [-c]` — Link channel to repo (`-c` continues last session)',
           '`!remove` — Remove this channel\'s session',
           '`!start` — Start this channel\'s session',
           '`!stop` — Stop this channel\'s session',
-          '`!last` — Show the most recent session (with resume command)',
+          '`!last` — Show the most recent session',
           '`!sessions` — List recent 5 sessions',
-          '`!resume <id>` — Resume a previous session',
+          '`!resume` — Continue the most recent session (`claude -c`)',
           '`!status` — Show all session statuses',
           '`!list` — List all configured sessions',
           '`!reload` — Reload session configs',
