@@ -90,9 +90,10 @@ channel_in_use() {
 
 # ─── ADD ────────────────────────────────────────────────────────────────────
 cmd_add() {
-    local name="${1:?Usage: $0 add <name> <repo-path> <channel-id>}"
+    local name="${1:?Usage: $0 add <name> <repo-path> <channel-id> [summary]}"
     local repo_path="${2:?Missing repo-path}"
     local channel_id="${3:?Missing discord-channel-id}"
+    local kind="${4:-}"
 
     if session_exists "$name"; then
         echo -e "${RED}Session '$name' already exists. Use 'remove' first.${NC}"
@@ -120,16 +121,22 @@ cmd_add() {
     local port
     port="$(next_port)"
 
-    cat > "$(session_conf "$name")" <<EOF
-repo_path=$repo_path
-channel_id=$channel_id
-port=$port
-EOF
+    {
+        echo "repo_path=$repo_path"
+        echo "channel_id=$channel_id"
+        echo "port=$port"
+        if [[ "$kind" == "summary" ]]; then
+            echo "is_summary=true"
+        fi
+    } > "$(session_conf "$name")"
 
     echo -e "${GREEN}Added session '$name'${NC}"
     echo -e "  Repo:      $repo_path"
     echo -e "  Channel:   $channel_id"
     echo -e "  Port:      $port"
+    if [[ "$kind" == "summary" ]]; then
+        echo -e "  Role:      ${CYAN}summarizer${NC}"
+    fi
     echo ""
     echo -e "${YELLOW}Next: ${CYAN}$0 start $name${NC}"
 }
@@ -416,8 +423,9 @@ Claude Code Discord Hub — Session Manager
 Usage: claude-sessions.sh <command> [args]
 
 Session Commands:
-  add <name> <repo-path> <channel-id>
-                      Register a new repo (port auto-assigned)
+  add <name> <repo-path> <channel-id> [summary]
+                      Register a new repo (port auto-assigned).
+                      Pass `summary` as 4th arg to mark as the summarizer session.
   start <name> [-c|--continue]
                       Start a Claude Code session (-c continues last)
   stop <name>         Stop a running session
