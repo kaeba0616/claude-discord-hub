@@ -21,7 +21,7 @@ import {
   type Message,
   type Interaction,
 } from 'discord.js'
-import { buildRouteMap, loadBotToken, type SessionConfig } from './config'
+import { buildRouteMap, findSummarySession, loadQueueChannels, loadBotToken, type SessionConfig } from './config'
 import { execSync } from 'child_process'
 import { join } from 'path'
 
@@ -58,6 +58,14 @@ setInterval(reloadRoutes, 10_000)
 // ─── Pending permissions (request_id → { channelId, port }) ──────────────
 
 const pendingPermissions = new Map<string, { channelId: string; port: number }>()
+
+// ─── Pending summaries (request_id → thread context) ─────────────────────
+
+const pendingSummaries = new Map<
+  string,
+  { threadId: string; requesterId: string; statusMsgId: string }
+>()
+const inFlightQueueChannels = new Set<string>()
 
 // ─── Message Handler ───────────────────────────────────────────────────────
 
@@ -164,6 +172,11 @@ async function handleCommand(msg: Message) {
       } catch {
         await msg.reply(`❌ Failed to resume session **${route.name}**.`)
       }
+      break
+    }
+
+    case 'summary': {
+      await handleSummaryCommand(msg)
       break
     }
 
@@ -306,6 +319,7 @@ async function handleCommand(msg: Message) {
           '`!last` — Show the most recent session',
           '`!sessions` — List recent 5 sessions',
           '`!resume` — Continue the most recent session (`claude -c`)',
+          '`!summary` — (in a thread) Summarize the meeting and auto-create a project',
           '`!status` — Show all session statuses',
           '`!list` — List all configured sessions',
           '`!reload` — Reload session configs',
@@ -317,6 +331,205 @@ async function handleCommand(msg: Message) {
 
     default:
       await msg.reply(`Unknown command: \`${cmd}\`. Try \`!help\`.`)
+  }
+}
+
+// ─── Summary Flow ──────────────────────────────────────────────────────────
+
+interface SummaryResult {
+  request_id: string
+  project_name: string
+  repo_path: string
+  brief: string
+}
+
+async function handleSummaryCommand(msg: Message) {
+  const channel = msg.channel
+  if (!channel.isThread()) {
+    await msg.reply('Use `!summary` inside a thread.')
+    return
+  }
+
+  const summary = findSummarySession()
+  if (!summary) {
+    await msg.reply('❌ Summary session is not configured. Add one with `claude-sessions.sh add <name> <repo> <channel-id> summary`.')
+    return
+  }
+
+  const fetched = await channel.messages.fetch({ limit: 100 })
+  const ordered = Array.from(fetched.values()).reverse()
+  const transcriptLines = ordered
+    .filter(m => !m.author.bot && !m.content.startsWith('!'))
+    .map(m => {
+      const ts = m.createdAt.toISOString().slice(11, 16)
+      return `[${m.author.username} ${ts}] ${m.content}`
+    })
+
+  if (transcriptLines.length === 0) {
+    await msg.reply('Nothing to summarize — the thread has no user messages.')
+    return
+  }
+
+  const requestId = crypto.randomUUID()
+  const status = await msg.reply('🔄 Summarizing...')
+
+  pendingSummaries.set(requestId, {
+    threadId: channel.id,
+    requesterId: msg.author.id,
+    statusMsgId: status.id,
+  })
+
+  const prompt = buildSummaryPrompt(requestId, transcriptLines.join('\n'))
+
+  try {
+    const res = await fetch(`http://localhost:${summary.port}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        content: prompt,
+        chat_id: summary.channelId,
+        message_id: msg.id,
+        user: msg.author.username,
+        user_id: msg.author.id,
+        ts: new Date().toISOString(),
+      }),
+    })
+    if (!res.ok) {
+      pendingSummaries.delete(requestId)
+      await status.edit('❌ Summary session is not running. Start it with `!start` in its channel.').catch(() => {})
+    }
+  } catch {
+    pendingSummaries.delete(requestId)
+    await status.edit('❌ Failed to reach summary session.').catch(() => {})
+  }
+}
+
+function buildSummaryPrompt(requestId: string, transcript: string): string {
+  return [
+    'You are summarizing a Discord meeting transcript into a new Claude Code project brief.',
+    'Output ONLY a single ```json``` code block, no other text before or after.',
+    '',
+    'Schema:',
+    '{',
+    `  "request_id": "${requestId}",`,
+    '  "project_name": "kebab-case-slug-from-meeting-topic",',
+    '  "repo_path": "~/dev/<slug>",',
+    '  "brief": "Korean: project goal + first concrete tasks for Claude to start"',
+    '}',
+    '',
+    `[REQUEST_ID=${requestId}]`,
+    '',
+    'Transcript:',
+    transcript,
+  ].join('\n')
+}
+
+async function tryHandleSummaryReply(text: string): Promise<boolean> {
+  const m = /```json\s*([\s\S]*?)\s*```/.exec(text) ?? /(\{[\s\S]*\})/.exec(text)
+  if (!m) return false
+  let parsed: SummaryResult
+  try {
+    parsed = JSON.parse(m[1]) as SummaryResult
+  } catch {
+    return false
+  }
+  if (!parsed.request_id || !parsed.project_name || !parsed.repo_path || !parsed.brief) {
+    return false
+  }
+  const ctx = pendingSummaries.get(parsed.request_id)
+  if (!ctx) return false
+  pendingSummaries.delete(parsed.request_id)
+  void processSummaryResult(parsed, ctx)
+  return true
+}
+
+async function processSummaryResult(
+  summary: SummaryResult,
+  ctx: { threadId: string; requesterId: string; statusMsgId: string },
+) {
+  const editStatus = async (content: string) => {
+    try {
+      const ch = await client.channels.fetch(ctx.threadId)
+      if (ch && ch.isTextBased()) {
+        const m = await (ch as any).messages.fetch(ctx.statusMsgId)
+        await m.edit(content)
+      }
+    } catch {}
+  }
+
+  const queueCh = pickFreeQueueChannel()
+  if (!queueCh) {
+    await editStatus('❌ No free queue channels. Add IDs to `~/.claude/channels/queue.txt`.')
+    return
+  }
+  inFlightQueueChannels.add(queueCh)
+
+  try {
+    const name = pickSessionName(summary.project_name)
+    const repoArg = shellEscape(summary.repo_path)
+    execSync(`${SCRIPT_PATH} add ${name} ${repoArg} ${queueCh}`, { encoding: 'utf8', timeout: 5000 })
+    execSync(`${SCRIPT_PATH} start ${name}`, { encoding: 'utf8', timeout: 15000 })
+    reloadRoutes()
+
+    // Wait for the new session's MCP bridge to come up
+    const newRoute = routes.get(queueCh)
+    if (newRoute) {
+      await waitForPort(newRoute.port, 8000)
+      await fetch(`http://localhost:${newRoute.port}/message`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: summary.brief,
+          chat_id: queueCh,
+          message_id: ctx.statusMsgId,
+          user: 'meeting-summary',
+          user_id: '0',
+          ts: new Date().toISOString(),
+        }),
+      }).catch(() => {})
+    }
+
+    await editStatus(`✅ 프로젝트 생성됨: <#${queueCh}> (\`${name}\`)`)
+  } catch (err) {
+    const m = err instanceof Error ? (err as any).stderr || err.message : String(err)
+    await editStatus(`❌ 프로젝트 생성 실패: ${String(m).replace(/\x1b\[[0-9;]*m/g, '').slice(0, 400)}`)
+  } finally {
+    inFlightQueueChannels.delete(queueCh)
+  }
+}
+
+function pickFreeQueueChannel(): string | null {
+  for (const id of loadQueueChannels()) {
+    if (routes.has(id)) continue
+    if (inFlightQueueChannels.has(id)) continue
+    return id
+  }
+  return null
+}
+
+function pickSessionName(slug: string): string {
+  const base = slug.replace(/[^a-z0-9-]/gi, '-').toLowerCase().replace(/^-+|-+$/g, '') || 'session'
+  const existing = new Set(Array.from(routes.values()).map(r => r.name))
+  if (!existing.has(base)) return base
+  for (let i = 2; i < 100; i++) {
+    const candidate = `${base}-${i}`
+    if (!existing.has(candidate)) return candidate
+  }
+  return `${base}-${Date.now()}`
+}
+
+function shellEscape(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+async function waitForPort(port: number, timeoutMs: number) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(500) })
+      if (res.ok) return
+    } catch {}
+    await new Promise(r => setTimeout(r, 500))
   }
 }
 
@@ -368,6 +581,18 @@ Bun.serve({
         channel_id: string
         text: string
         reply_to?: string
+      }
+
+      // Intercept replies from the summary session
+      const summary = findSummarySession()
+      if (summary && json.channel_id === summary.channelId) {
+        const handled = await tryHandleSummaryReply(json.text)
+        if (handled) {
+          return new Response(JSON.stringify({ ok: true, intercepted: true }), {
+            headers: { 'content-type': 'application/json' },
+          })
+        }
+        // fall through to post the raw reply for debugging if JSON parse fails
       }
 
       try {
