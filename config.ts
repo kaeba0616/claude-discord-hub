@@ -8,6 +8,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 
 export const SESSIONS_DIR = join(homedir(), '.claude', 'channels', 'sessions')
+export const QUEUE_FILE = join(homedir(), '.claude', 'channels', 'queue.txt')
 export const BASE_PORT = 9001
 
 export interface SessionConfig {
@@ -15,6 +16,7 @@ export interface SessionConfig {
   repoPath: string
   channelId: string
   port: number
+  isSummary: boolean
 }
 
 /** Parse a single .conf file into a SessionConfig */
@@ -29,6 +31,7 @@ function parseConf(name: string, content: string): SessionConfig {
     repoPath: fields.repo_path ?? '',
     channelId: fields.channel_id ?? '',
     port: Number(fields.port) || BASE_PORT,
+    isSummary: fields.is_summary === 'true',
   }
 }
 
@@ -54,6 +57,24 @@ export function buildRouteMap(): Map<string, SessionConfig> {
     }
   }
   return map
+}
+
+/** Find the session marked as the summarizer, if any */
+export function findSummarySession(): SessionConfig | undefined {
+  return loadSessions().find(s => s.isSummary && s.channelId)
+}
+
+/** Load queue channel IDs from ~/.claude/channels/queue.txt */
+export function loadQueueChannels(): string[] {
+  try {
+    const content = readFileSync(QUEUE_FILE, 'utf8')
+    return content
+      .split('\n')
+      .map(l => l.trim())
+      .filter(l => l && !l.startsWith('#'))
+  } catch {
+    return []
+  }
 }
 
 /** Load bot token from .env file in project root */
