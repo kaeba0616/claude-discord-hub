@@ -21,7 +21,17 @@ import {
   type Message,
   type Interaction,
 } from 'discord.js'
-import { buildRouteMap, findSummarySession, loadQueueChannels, loadBotToken, type SessionConfig } from './config'
+import {
+  buildRouteMap,
+  loadSessions,
+  findSummarySession,
+  loadThreadLinks,
+  linkThread,
+  unlinkThread,
+  getThreadLink,
+  loadBotToken,
+  type SessionConfig,
+} from './config'
 import { execSync } from 'child_process'
 import { join } from 'path'
 
@@ -63,9 +73,8 @@ const pendingPermissions = new Map<string, { channelId: string; port: number }>(
 
 const pendingSummaries = new Map<
   string,
-  { threadId: string; requesterId: string; statusMsgId: string }
+  { threadId: string; requesterId: string; statusMsgId: string; sessionName: string }
 >()
-const inFlightQueueChannels = new Set<string>()
 
 // ─── Message Handler ───────────────────────────────────────────────────────
 
@@ -177,6 +186,16 @@ async function handleCommand(msg: Message) {
 
     case 'summary': {
       await handleSummaryCommand(msg)
+      break
+    }
+
+    case 'link': {
+      await handleLinkCommand(msg, args)
+      break
+    }
+
+    case 'unlink': {
+      await handleUnlinkCommand(msg)
       break
     }
 
@@ -319,7 +338,9 @@ async function handleCommand(msg: Message) {
           '`!last` — Show the most recent session',
           '`!sessions` — List recent 5 sessions',
           '`!resume` — Continue the most recent session (`claude -c`)',
-          '`!summary` — (in a thread) Summarize the meeting and auto-create a project',
+          '`!link <session>` — (in a thread) Link this thread to an existing project session',
+          '`!unlink` — (in a thread) Remove the link',
+          '`!summary` — (in a linked thread) Summarize the meeting and forward to the linked session',
           '`!status` — Show all session statuses',
           '`!list` — List all configured sessions',
           '`!reload` — Reload session configs',
@@ -334,25 +355,69 @@ async function handleCommand(msg: Message) {
   }
 }
 
-// ─── Summary Flow ──────────────────────────────────────────────────────────
+// ─── Summary Flow (link-based) ────────────────────────────────────────────
 
-interface SummaryResult {
+interface SummaryReply {
   request_id: string
-  project_name: string
-  repo_path: string
-  brief: string
+  summary: string
+}
+
+async function handleLinkCommand(msg: Message, args: string[]) {
+  if (!msg.channel.isThread()) {
+    await msg.reply('`!link`은 스레드 안에서만 실행할 수 있어요.')
+    return
+  }
+  const sessionName = args[0]
+  if (!sessionName) {
+    await msg.reply('Usage: `!link <session-name>` (예: `!link homepage-renewal`)\n`!list`로 사용 가능한 세션을 확인하세요.')
+    return
+  }
+  const session = loadSessions().find(s => s.name === sessionName)
+  if (!session) {
+    await msg.reply(`❌ 세션 \`${sessionName}\`을(를) 찾을 수 없어요. \`!list\`로 확인하세요.`)
+    return
+  }
+  if (session.isSummary) {
+    await msg.reply('❌ 요약 전용 세션에는 연결할 수 없어요.')
+    return
+  }
+  linkThread(msg.channelId, sessionName)
+  await msg.reply(`🔗 이 스레드를 **${sessionName}** (<#${session.channelId}>)에 연결했어요. 회의 후 \`!summary\`를 실행하세요.`)
+}
+
+async function handleUnlinkCommand(msg: Message) {
+  if (!msg.channel.isThread()) {
+    await msg.reply('`!unlink`은 스레드 안에서만 실행할 수 있어요.')
+    return
+  }
+  if (unlinkThread(msg.channelId)) {
+    await msg.reply('🔓 링크를 해제했어요.')
+  } else {
+    await msg.reply('이 스레드는 연결되어 있지 않아요.')
+  }
 }
 
 async function handleSummaryCommand(msg: Message) {
   const channel = msg.channel
   if (!channel.isThread()) {
-    await msg.reply('Use `!summary` inside a thread.')
+    await msg.reply('`!summary`는 스레드 안에서만 실행할 수 있어요.')
     return
   }
 
-  const summary = findSummarySession()
-  if (!summary) {
-    await msg.reply('❌ Summary session is not configured. Add one with `claude-sessions.sh add <name> <repo> <channel-id> summary`.')
+  const sessionName = getThreadLink(channel.id)
+  if (!sessionName) {
+    await msg.reply('❌ 이 스레드는 어떤 세션과도 연결되어 있지 않아요. 먼저 `!link <session-name>`을 실행하세요.')
+    return
+  }
+  const target = loadSessions().find(s => s.name === sessionName)
+  if (!target) {
+    await msg.reply(`❌ 연결된 세션 \`${sessionName}\`이(가) 더 이상 존재하지 않아요. \`!unlink\` 후 다시 연결하세요.`)
+    return
+  }
+
+  const summarizer = findSummarySession()
+  if (!summarizer) {
+    await msg.reply('❌ 요약 세션이 설정되지 않았어요.')
     return
   }
 
@@ -366,28 +431,29 @@ async function handleSummaryCommand(msg: Message) {
     })
 
   if (transcriptLines.length === 0) {
-    await msg.reply('Nothing to summarize — the thread has no user messages.')
+    await msg.reply('요약할 내용이 없어요 — 스레드에 사용자 메시지가 없습니다.')
     return
   }
 
   const requestId = crypto.randomUUID()
-  const status = await msg.reply('🔄 Summarizing...')
+  const status = await msg.reply(`🔄 요약 중... (\`${sessionName}\`로 전송 예정)`)
 
   pendingSummaries.set(requestId, {
     threadId: channel.id,
     requesterId: msg.author.id,
     statusMsgId: status.id,
+    sessionName,
   })
 
   const prompt = buildSummaryPrompt(requestId, transcriptLines.join('\n'))
 
   try {
-    const res = await fetch(`http://localhost:${summary.port}/message`, {
+    const res = await fetch(`http://localhost:${summarizer.port}/message`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({
         content: prompt,
-        chat_id: summary.channelId,
+        chat_id: summarizer.channelId,
         message_id: msg.id,
         user: msg.author.username,
         user_id: msg.author.id,
@@ -396,25 +462,23 @@ async function handleSummaryCommand(msg: Message) {
     })
     if (!res.ok) {
       pendingSummaries.delete(requestId)
-      await status.edit('❌ Summary session is not running. Start it with `!start` in its channel.').catch(() => {})
+      await status.edit('❌ 요약 세션이 응답하지 않아요. `!start`로 시작하세요.').catch(() => {})
     }
   } catch {
     pendingSummaries.delete(requestId)
-    await status.edit('❌ Failed to reach summary session.').catch(() => {})
+    await status.edit('❌ 요약 세션에 연결할 수 없어요.').catch(() => {})
   }
 }
 
 function buildSummaryPrompt(requestId: string, transcript: string): string {
   return [
-    'You are summarizing a Discord meeting transcript into a new Claude Code project brief.',
+    'You are summarizing a Discord meeting transcript so the linked Claude Code project session can act on it.',
     'Output ONLY a single ```json``` code block, no other text before or after.',
     '',
     'Schema:',
     '{',
     `  "request_id": "${requestId}",`,
-    '  "project_name": "kebab-case-slug-from-meeting-topic",',
-    '  "repo_path": "~/dev/<slug>",',
-    '  "brief": "Korean: project goal + first concrete tasks for Claude to start"',
+    '  "summary": "Korean markdown. Sections: ## 결정사항, ## Action Items, ## 다음 단계. Be concrete and short."',
     '}',
     '',
     `[REQUEST_ID=${requestId}]`,
@@ -427,25 +491,23 @@ function buildSummaryPrompt(requestId: string, transcript: string): string {
 async function tryHandleSummaryReply(text: string): Promise<boolean> {
   const m = /```json\s*([\s\S]*?)\s*```/.exec(text) ?? /(\{[\s\S]*\})/.exec(text)
   if (!m) return false
-  let parsed: SummaryResult
+  let parsed: SummaryReply
   try {
-    parsed = JSON.parse(m[1]) as SummaryResult
+    parsed = JSON.parse(m[1]) as SummaryReply
   } catch {
     return false
   }
-  if (!parsed.request_id || !parsed.project_name || !parsed.repo_path || !parsed.brief) {
-    return false
-  }
+  if (!parsed.request_id || !parsed.summary) return false
   const ctx = pendingSummaries.get(parsed.request_id)
   if (!ctx) return false
   pendingSummaries.delete(parsed.request_id)
-  void processSummaryResult(parsed, ctx)
+  void forwardSummaryToSession(parsed.summary, ctx)
   return true
 }
 
-async function processSummaryResult(
-  summary: SummaryResult,
-  ctx: { threadId: string; requesterId: string; statusMsgId: string },
+async function forwardSummaryToSession(
+  summary: string,
+  ctx: { threadId: string; statusMsgId: string; sessionName: string },
 ) {
   const editStatus = async (content: string) => {
     try {
@@ -457,79 +519,44 @@ async function processSummaryResult(
     } catch {}
   }
 
-  const queueCh = pickFreeQueueChannel()
-  if (!queueCh) {
-    await editStatus('❌ No free queue channels. Add IDs to `~/.claude/channels/queue.txt`.')
+  const target = loadSessions().find(s => s.name === ctx.sessionName)
+  if (!target) {
+    await editStatus(`❌ 세션 \`${ctx.sessionName}\`이(가) 사라졌어요.`)
     return
   }
-  inFlightQueueChannels.add(queueCh)
 
+  // Post the summary in the meeting thread itself for record
   try {
-    const name = pickSessionName(summary.project_name)
-    const repoArg = shellEscape(summary.repo_path)
-    execSync(`${SCRIPT_PATH} add ${name} ${repoArg} ${queueCh}`, { encoding: 'utf8', timeout: 5000 })
-    execSync(`${SCRIPT_PATH} start ${name}`, { encoding: 'utf8', timeout: 15000 })
-    reloadRoutes()
-
-    // Wait for the new session's MCP bridge to come up
-    const newRoute = routes.get(queueCh)
-    if (newRoute) {
-      await waitForPort(newRoute.port, 8000)
-      await fetch(`http://localhost:${newRoute.port}/message`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          content: summary.brief,
-          chat_id: queueCh,
-          message_id: ctx.statusMsgId,
-          user: 'meeting-summary',
-          user_id: '0',
-          ts: new Date().toISOString(),
-        }),
-      }).catch(() => {})
+    const ch = await client.channels.fetch(ctx.threadId)
+    if (ch && ch.isTextBased()) {
+      for (const chunk of splitMessage(`📝 **요약**\n\n${summary}`, 2000)) {
+        await (ch as any).send(chunk)
+      }
     }
+  } catch {}
 
-    await editStatus(`✅ 프로젝트 생성됨: <#${queueCh}> (\`${name}\`)`)
+  // Forward to linked session as a regular message it should act on
+  const wrapped = `다음은 회의 요약입니다. 이 내용을 바탕으로 작업을 진행해주세요.\n\n${summary}`
+  try {
+    const res = await fetch(`http://localhost:${target.port}/message`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        content: wrapped,
+        chat_id: target.channelId,
+        message_id: ctx.statusMsgId,
+        user: 'meeting-summary',
+        user_id: '0',
+        ts: new Date().toISOString(),
+      }),
+    })
+    if (!res.ok) {
+      await editStatus(`❌ 세션 \`${ctx.sessionName}\`에 전송 실패. 세션이 실행 중인지 확인하세요 (\`!start\`).`)
+      return
+    }
+    await editStatus(`✅ 요약을 \`${ctx.sessionName}\` (<#${target.channelId}>)로 전송했어요.`)
   } catch (err) {
-    const m = err instanceof Error ? (err as any).stderr || err.message : String(err)
-    await editStatus(`❌ 프로젝트 생성 실패: ${String(m).replace(/\x1b\[[0-9;]*m/g, '').slice(0, 400)}`)
-  } finally {
-    inFlightQueueChannels.delete(queueCh)
-  }
-}
-
-function pickFreeQueueChannel(): string | null {
-  for (const id of loadQueueChannels()) {
-    if (routes.has(id)) continue
-    if (inFlightQueueChannels.has(id)) continue
-    return id
-  }
-  return null
-}
-
-function pickSessionName(slug: string): string {
-  const base = slug.replace(/[^a-z0-9-]/gi, '-').toLowerCase().replace(/^-+|-+$/g, '') || 'session'
-  const existing = new Set(Array.from(routes.values()).map(r => r.name))
-  if (!existing.has(base)) return base
-  for (let i = 2; i < 100; i++) {
-    const candidate = `${base}-${i}`
-    if (!existing.has(candidate)) return candidate
-  }
-  return `${base}-${Date.now()}`
-}
-
-function shellEscape(s: string): string {
-  return `'${s.replace(/'/g, `'\\''`)}'`
-}
-
-async function waitForPort(port: number, timeoutMs: number) {
-  const start = Date.now()
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const res = await fetch(`http://localhost:${port}/health`, { signal: AbortSignal.timeout(500) })
-      if (res.ok) return
-    } catch {}
-    await new Promise(r => setTimeout(r, 500))
+    await editStatus(`❌ 전송 실패: ${err instanceof Error ? err.message : 'unknown'}`)
   }
 }
 
@@ -538,28 +565,23 @@ async function waitForPort(port: number, timeoutMs: number) {
 client.on('interactionCreate', async (interaction: Interaction) => {
   if (!interaction.isButton()) return
 
-  const m = /^perm:(allow|deny):(.+)$/.exec(interaction.customId)
-  if (!m) return
+  const permMatch = /^perm:(allow|deny):(.+)$/.exec(interaction.customId)
+  if (!permMatch) return
 
-  const behavior = m[1] as 'allow' | 'deny'
-  const requestId = m[2]
-
+  const behavior = permMatch[1] as 'allow' | 'deny'
+  const requestId = permMatch[2]
   const pending = pendingPermissions.get(requestId)
   if (!pending) {
     await interaction.reply({ content: 'This permission request has expired.', ephemeral: true })
     return
   }
-
-  // Send decision back to MCP channel
   try {
     await fetch(`http://localhost:${pending.port}/permission-response`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ request_id: requestId, behavior }),
     })
-
     pendingPermissions.delete(requestId)
-
     await interaction.message.delete().catch(() => {})
     await interaction.deferUpdate().catch(() => {})
   } catch {
