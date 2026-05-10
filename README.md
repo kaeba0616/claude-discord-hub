@@ -17,6 +17,7 @@ Discord Server (봇 1개)
 - **`bot.ts`** — Discord gateway 연결 + 채널→세션 라우팅 + 관리 명령어
 - **`channel.ts`** — Bridge MCP 채널 (세션마다 1개, HTTP로 메시지 수신 → Claude에 전달)
 - **`claude-sessions.sh`** — 세션 등록/시작/중지 매니저
+- **`config.ts`** — 공유 설정 유틸 (세션 conf 파싱, 토큰 로드)
 
 ## Prerequisites
 
@@ -72,19 +73,14 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 레포 폴더가 없으면 자동 생성됩니다.
 
-### 기존 세션 이어서 연결 (Discord에서)
+### 마지막 대화 이어서 시작
 
-세션 ID를 알고 있다면 `!add` 시 바로 resume 가능:
 ```
-!add myproject ~/dev/myproject <session-id>
+!add myproject ~/dev/myproject -c    # 등록과 동시에 마지막 대화 이어서
 ```
-
-세션 ID를 모르면 먼저 연결 후 찾기:
+또는 이미 등록된 채널에서:
 ```
-!add myproject ~/dev/myproject       # 일단 새 세션으로 연결
-!sessions                            # 기존 세션 목록에서 ID 확인
-!stop                                # 새 세션 중지
-!resume <id>                         # 원하는 기존 세션으로 전환
+!resume                              # claude -c 로 이어서
 ```
 
 ### 새 프로젝트 연결 (터미널에서)
@@ -94,8 +90,8 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 ./claude-sessions.sh add myproject ~/dev/myproject <channel-id>
 ./claude-sessions.sh start myproject
 
-# 기존 세션 이어서
-./claude-sessions.sh start myproject --resume "<session-id>"
+# 마지막 대화 이어서
+./claude-sessions.sh start myproject -c
 ```
 
 ### 세션 중지/삭제 (Discord에서)
@@ -105,13 +101,36 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 둘 다 레포 폴더와 코드는 건드리지 않습니다.
 
-### 이전 세션 이어서 하기
+### 이전 세션 목록 / 이어서 하기
 
 ```
-!last              # 가장 최근 세션 ID 확인
+!last              # 가장 최근 세션 확인
 !sessions          # 최근 5개 세션 목록 (현재 채널 레포만)
-!resume <id>       # 이전 대화 이어서 시작
+!resume            # 마지막 대화 이어서 시작 (claude -c)
 ```
+
+### 회의 요약 → 프로젝트 세션에 전달
+
+각 프로젝트 채널에서 회의를 thread로 만들고, `!summary`로 회의 내용을 요약해 그 채널의 Claude 세션으로 전달할 수 있습니다.
+
+**사전 설정 (최초 1회):** 요약 전용 Claude 세션이 필요합니다.
+
+```bash
+# 디스코드에 요약 전용 채널 만들고 ID 복사 후
+./claude-sessions.sh add summarizer ~/work/summarizer-workspace <SUMMARY_CH_ID> summary
+./claude-sessions.sh start summarizer
+```
+
+요약 세션의 워크스페이스(`~/work/summarizer-workspace/CLAUDE.md`)에 "회의 transcript를 받으면 정해진 JSON 스키마로만 응답하라"는 시스템 프롬프트를 넣어두세요. (이 레포의 예시 참고)
+
+**사용:**
+1. 프로젝트 채널 (예: `#myproject`, 이미 `!add`로 세션 연결된 채널) 안에서 메시지 우클릭 → **스레드 만들기**
+2. 스레드에서 회의 진행
+3. 스레드에서 `!summary` 입력
+4. 봇이:
+   - 요약 세션에 transcript를 전달 → JSON으로 한국어 요약 받음
+   - 요약본을 스레드에 게시 (회의록)
+   - 그 채널의 프로젝트 Claude에 요약을 forwarding → Claude가 요약대로 작업 진행
 
 ### 전체 시작/중지
 
@@ -124,13 +143,14 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 | 명령어 | 설명 |
 |--------|------|
-| `!add <name> <repo-path> [session-id]` | 채널을 레포에 연결 (세션 ID로 resume 가능) |
+| `!add <name> <repo-path> [-c]` | 채널을 레포에 연결 (`-c`로 마지막 대화 이어서) |
 | `!remove` | 현재 채널의 세션 삭제 |
 | `!start` | 세션 시작 |
 | `!stop` | 세션 중지 |
-| `!last` | 가장 최근 세션 ID |
+| `!resume` | 마지막 대화 이어서 (`claude -c`) |
+| `!last` | 가장 최근 세션 |
 | `!sessions` | 최근 5개 세션 목록 |
-| `!resume <id>` | 이전 세션 이어서 |
+| `!summary` | (스레드에서) 회의 요약 → 상위 채널 세션에 전달 |
 | `!status` | 모든 세션 상태 |
 | `!list` | 등록된 세션 목록 |
 | `!reload` | 설정 새로고침 |
@@ -142,8 +162,8 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 
 | 명령 | 설명 |
 |------|------|
-| `add <name> <repo> <channel-id>` | 세션 등록 (포트 자동 할당) |
-| `start <name> [--resume <id>]` | 세션 시작 |
+| `add <name> <repo> <channel-id> [summary]` | 세션 등록 (포트 자동 할당, `summary` 인자로 요약 세션 마킹) |
+| `start <name> [-c]` | 세션 시작 (`-c`로 마지막 대화 이어서) |
 | `stop <name>` | 세션 중지 |
 | `start-all` | 봇 + 모든 세션 시작 |
 | `stop-all` | 모든 세션 + 봇 중지 |
@@ -178,10 +198,10 @@ channel.ts           # Bridge MCP 채널 (세션마다 1개)
 config.ts            # 공유 설정 유틸
 claude-sessions.sh   # 매니저 스크립트
 .env                 # 봇 토큰 (git에 포함 안 됨)
-.mcp.json            # 자동 생성 (git에 포함 안 됨)
+.mcp.json            # 자동 생성 (각 레포에)
 
 ~/.claude/channels/sessions/
-├── myproject.conf   # repo_path, channel_id, port
+├── myproject.conf   # repo_path, channel_id, port, is_summary
 └── backend.conf
 ```
 
@@ -194,3 +214,4 @@ claude-sessions.sh   # 매니저 스크립트
 | 봇이 메시지를 무시 | Developer Portal > Bot > **Message Content Intent** 활성화 확인 |
 | 세션 시작 안 됨 | `tmux attach -t claude-<name>`으로 직접 확인 |
 | `!add` 실패 | 레포 경로가 서버의 절대경로 또는 `~/` 경로인지 확인 |
+| `!summary` "요약 세션이 설정되지 않았어요" | 위 "회의 요약" 섹션의 사전 설정 단계 수행 |
