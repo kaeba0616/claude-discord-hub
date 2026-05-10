@@ -25,10 +25,6 @@ import {
   buildRouteMap,
   loadSessions,
   findSummarySession,
-  loadThreadLinks,
-  linkThread,
-  unlinkThread,
-  getThreadLink,
   loadBotToken,
   type SessionConfig,
 } from './config'
@@ -189,16 +185,6 @@ async function handleCommand(msg: Message) {
       break
     }
 
-    case 'link': {
-      await handleLinkCommand(msg, args)
-      break
-    }
-
-    case 'unlink': {
-      await handleUnlinkCommand(msg)
-      break
-    }
-
     case 'add': {
       const existingRoute = routes.get(msg.channelId)
       if (existingRoute) {
@@ -338,9 +324,7 @@ async function handleCommand(msg: Message) {
           '`!last` — Show the most recent session',
           '`!sessions` — List recent 5 sessions',
           '`!resume` — Continue the most recent session (`claude -c`)',
-          '`!link <session>` — (in a thread) Link this thread to an existing project session',
-          '`!unlink` — (in a thread) Remove the link',
-          '`!summary` — (in a linked thread) Summarize the meeting and forward to the linked session',
+          '`!summary` — (in a thread) Summarize the meeting and forward to this channel\'s session',
           '`!status` — Show all session statuses',
           '`!list` — List all configured sessions',
           '`!reload` — Reload session configs',
@@ -355,46 +339,11 @@ async function handleCommand(msg: Message) {
   }
 }
 
-// ─── Summary Flow (link-based) ────────────────────────────────────────────
+// ─── Summary Flow ──────────────────────────────────────────────────────────
 
 interface SummaryReply {
   request_id: string
   summary: string
-}
-
-async function handleLinkCommand(msg: Message, args: string[]) {
-  if (!msg.channel.isThread()) {
-    await msg.reply('`!link`은 스레드 안에서만 실행할 수 있어요.')
-    return
-  }
-  const sessionName = args[0]
-  if (!sessionName) {
-    await msg.reply('Usage: `!link <session-name>` (예: `!link homepage-renewal`)\n`!list`로 사용 가능한 세션을 확인하세요.')
-    return
-  }
-  const session = loadSessions().find(s => s.name === sessionName)
-  if (!session) {
-    await msg.reply(`❌ 세션 \`${sessionName}\`을(를) 찾을 수 없어요. \`!list\`로 확인하세요.`)
-    return
-  }
-  if (session.isSummary) {
-    await msg.reply('❌ 요약 전용 세션에는 연결할 수 없어요.')
-    return
-  }
-  linkThread(msg.channelId, sessionName)
-  await msg.reply(`🔗 이 스레드를 **${sessionName}** (<#${session.channelId}>)에 연결했어요. 회의 후 \`!summary\`를 실행하세요.`)
-}
-
-async function handleUnlinkCommand(msg: Message) {
-  if (!msg.channel.isThread()) {
-    await msg.reply('`!unlink`은 스레드 안에서만 실행할 수 있어요.')
-    return
-  }
-  if (unlinkThread(msg.channelId)) {
-    await msg.reply('🔓 링크를 해제했어요.')
-  } else {
-    await msg.reply('이 스레드는 연결되어 있지 않아요.')
-  }
 }
 
 async function handleSummaryCommand(msg: Message) {
@@ -404,14 +353,18 @@ async function handleSummaryCommand(msg: Message) {
     return
   }
 
-  const sessionName = getThreadLink(channel.id)
-  if (!sessionName) {
-    await msg.reply('❌ 이 스레드는 어떤 세션과도 연결되어 있지 않아요. 먼저 `!link <session-name>`을 실행하세요.')
+  const parentId = channel.parentId
+  if (!parentId) {
+    await msg.reply('❌ 이 스레드의 상위 채널을 찾을 수 없어요.')
     return
   }
-  const target = loadSessions().find(s => s.name === sessionName)
+  const target = routes.get(parentId)
   if (!target) {
-    await msg.reply(`❌ 연결된 세션 \`${sessionName}\`이(가) 더 이상 존재하지 않아요. \`!unlink\` 후 다시 연결하세요.`)
+    await msg.reply(`❌ 이 스레드가 속한 채널 <#${parentId}>은(는) 어떤 세션과도 연결되어 있지 않아요. \`!add\`로 먼저 세션을 등록하세요.`)
+    return
+  }
+  if (target.isSummary) {
+    await msg.reply('❌ 요약 전용 세션 채널에서는 `!summary`를 사용할 수 없어요.')
     return
   }
 
@@ -436,13 +389,13 @@ async function handleSummaryCommand(msg: Message) {
   }
 
   const requestId = crypto.randomUUID()
-  const status = await msg.reply(`🔄 요약 중... (\`${sessionName}\`로 전송 예정)`)
+  const status = await msg.reply(`🔄 요약 중... (\`${target.name}\`로 전송 예정)`)
 
   pendingSummaries.set(requestId, {
     threadId: channel.id,
     requesterId: msg.author.id,
     statusMsgId: status.id,
-    sessionName,
+    sessionName: target.name,
   })
 
   const prompt = buildSummaryPrompt(requestId, transcriptLines.join('\n'))
