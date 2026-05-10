@@ -114,7 +114,7 @@ mcp.setNotificationHandler(
     const { request_id, tool_name, description, input_preview } = params
 
     // Auto-approve our own reply tool — no need for user confirmation
-    if (tool_name.includes('reply')) {
+    if (tool_name === 'reply' || tool_name === 'mcp__claude_bridge__reply') {
       void mcp.notification({
         method: 'notifications/claude/channel/permission',
         params: { request_id, behavior: 'allow' as const },
