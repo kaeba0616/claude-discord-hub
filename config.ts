@@ -3,12 +3,12 @@
  * Reads session configs from ~/.claude/channels/sessions/*.conf
  */
 
-import { readFileSync, readdirSync } from 'fs'
+import { readFileSync, readdirSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
 export const SESSIONS_DIR = join(homedir(), '.claude', 'channels', 'sessions')
-export const QUEUE_FILE = join(homedir(), '.claude', 'channels', 'queue.txt')
+export const THREAD_LINKS_FILE = join(homedir(), '.claude', 'channels', 'thread-links.json')
 export const BASE_PORT = 9001
 
 export interface SessionConfig {
@@ -64,17 +64,34 @@ export function findSummarySession(): SessionConfig | undefined {
   return loadSessions().find(s => s.isSummary && s.channelId)
 }
 
-/** Load queue channel IDs from ~/.claude/channels/queue.txt */
-export function loadQueueChannels(): string[] {
+/** Load all thread → session links from disk */
+export function loadThreadLinks(): Record<string, string> {
   try {
-    const content = readFileSync(QUEUE_FILE, 'utf8')
-    return content
-      .split('\n')
-      .map(l => l.trim())
-      .filter(l => l && !l.startsWith('#'))
+    return JSON.parse(readFileSync(THREAD_LINKS_FILE, 'utf8')) as Record<string, string>
   } catch {
-    return []
+    return {}
   }
+}
+
+/** Set the session link for a thread */
+export function linkThread(threadId: string, sessionName: string): void {
+  const links = loadThreadLinks()
+  links[threadId] = sessionName
+  writeFileSync(THREAD_LINKS_FILE, JSON.stringify(links, null, 2) + '\n')
+}
+
+/** Remove a thread link. Returns true if a link was removed. */
+export function unlinkThread(threadId: string): boolean {
+  const links = loadThreadLinks()
+  if (!(threadId in links)) return false
+  delete links[threadId]
+  writeFileSync(THREAD_LINKS_FILE, JSON.stringify(links, null, 2) + '\n')
+  return true
+}
+
+/** Get the session name a thread is linked to, if any */
+export function getThreadLink(threadId: string): string | undefined {
+  return loadThreadLinks()[threadId]
 }
 
 /** Load bot token from .env file in project root */
