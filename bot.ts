@@ -100,10 +100,25 @@ client.on('messageCreate', (msg: Message) => {
 })
 
 client.on('interactionCreate', (interaction: Interaction) => {
-  if (!interaction.isButton()) return
-  void app.handlePermissionButton(interaction).catch(err =>
-    console.error('[handlePermissionButton]', err),
-  )
+  if (interaction.isButton()) {
+    if (interaction.customId.startsWith('perm:')) {
+      void app.handlePermissionButton(interaction).catch(err =>
+        console.error('[handlePermissionButton]', err),
+      )
+    } else if (interaction.customId.startsWith('summary:')) {
+      void app.handleSummaryButton(interaction).catch(err =>
+        console.error('[handleSummaryButton]', err),
+      )
+    }
+    return
+  }
+  if (interaction.isModalSubmit()) {
+    if (interaction.customId.startsWith('summary:editmodal:')) {
+      void app.handleSummaryModalSubmit(interaction).catch(err =>
+        console.error('[handleSummaryModalSubmit]', err),
+      )
+    }
+  }
 })
 
 // ─── HTTP API ─────────────────────────────────────────────────────────────

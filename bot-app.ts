@@ -9,8 +9,12 @@ import {
   ButtonBuilder,
   ButtonStyle,
   ActionRowBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
   type Message,
   type ButtonInteraction,
+  type ModalSubmitInteraction,
 } from 'discord.js'
 import type { SessionConfig } from './config'
 
@@ -24,7 +28,7 @@ export interface SessionEntry {
 
 export interface DiscordMessageRef {
   id: string
-  edit(content: string): Promise<unknown>
+  edit(content: string | { content?: string; components?: unknown[] }): Promise<unknown>
 }
 
 export interface DiscordChannel {
@@ -66,12 +70,33 @@ export interface EphemeralSummary {
   threadId: string
   statusMsgId: string
   requestId: string
+  // Parent project session info — captured at !summary time, forwarded
+  // to the summary action so Accept knows where to send the summary.
+  parentChannelId: string
+  parentSessionName: string
+  parentSessionPort: number
   timeoutHandle?: ReturnType<typeof setTimeout>
+}
+
+export interface PendingSummaryAction {
+  id: string
+  threadId: string
+  buttonMsgId: string
+  summary: string
+  parentChannelId: string
+  parentSessionName: string
+  parentSessionPort: number
+  requesterId: string
 }
 
 export const EPHEMERAL_PREFIX = 'ephemeral-'
 export const EPHEMERAL_BOOT_TIMEOUT_MS = 30_000
 export const EPHEMERAL_REPLY_TIMEOUT_MS = 90_000
+
+export const SUMMARY_BUTTON_PREFIX = 'summary:'
+export const SUMMARY_MODAL_PREFIX = 'summary:editmodal:'
+const SUMMARY_TEXT_INPUT_ID = 'summary_text'
+const SUMMARY_MAX_INPUT_LEN = 4000
 
 export const NOT_LINKED = '❌ This channel is not linked to a session.'
 
@@ -102,6 +127,7 @@ interface SummaryReply {
 export function createApp(deps: AppDeps) {
   const pendingPermissions = new Map<string, PendingPermission>()
   const ephemeralSummaries = new Map<string, EphemeralSummary>()
+  const pendingSummaryActions = new Map<string, PendingSummaryAction>()
 
   // ── messageCreate entry point ──
   async function handleMessage(msg: Message): Promise<void> {
@@ -369,6 +395,9 @@ export function createApp(deps: AppDeps) {
         threadId: channel.id,
         statusMsgId: status.id,
         requestId,
+        parentChannelId: parentId,
+        parentSessionName: parent.name,
+        parentSessionPort: parent.port,
         timeoutHandle,
       })
       registered = true
@@ -401,8 +430,10 @@ export function createApp(deps: AppDeps) {
     }
   }
 
-  // Inbound /reply for an ephemeral session — parse JSON, post summary to
-  // thread, tear down the session. Returns true if intercepted.
+  // Inbound /reply for an ephemeral session — parse JSON, post the summary
+  // in the thread WITH Accept/Edit/Reject buttons, register a pending
+  // action keyed by id, and tear down the Claude session. Returns true if
+  // intercepted.
   async function tryHandleEphemeralReply(channelId: string, text: string): Promise<boolean> {
     if (!channelId.startsWith(EPHEMERAL_PREFIX)) return false
     const ctx = ephemeralSummaries.get(channelId)
@@ -419,22 +450,90 @@ export function createApp(deps: AppDeps) {
       } catch {}
     }
 
-    if (parsed?.summary) {
-      const header =
-        parsed.request_id === ctx.requestId
-          ? '📝 **요약**'
-          : '⚠️ **요약** (request_id mismatch — 신뢰성 낮음)'
-      await sendChannelMessage(ctx.threadId, `${header}\n\n${parsed.summary}`).catch(() => {})
-      await editMessage(ctx.threadId, ctx.statusMsgId, '✅ 요약 완료').catch(() => {})
-    } else {
+    if (!parsed?.summary) {
       await editMessage(ctx.threadId, ctx.statusMsgId, '❌ Claude 응답 파싱 실패').catch(() => {})
       await sendChannelMessage(
         ctx.threadId,
         `**Raw 응답:**\n\`\`\`\n${text.slice(0, 1500)}\n\`\`\``,
       ).catch(() => {})
+      safeRemove(channelId)
+      return true
     }
+
+    const mismatchWarning =
+      parsed.request_id === ctx.requestId
+        ? ''
+        : ' ⚠️ _(request_id mismatch — 신뢰성 낮음)_'
+
+    const actionId = deps.uuid()
+    const channel = await deps.fetchChannel(ctx.threadId)
+    if (channel && channel.isTextBased()) {
+      const buttonMsg = await channel.send({
+        content: renderActionMessage({
+          summary: parsed.summary,
+          parentChannelId: ctx.parentChannelId,
+          parentSessionName: ctx.parentSessionName,
+          mismatchWarning,
+          status: 'pending',
+        }),
+        components: [actionRowFor(actionId)],
+      })
+      pendingSummaryActions.set(actionId, {
+        id: actionId,
+        threadId: ctx.threadId,
+        buttonMsgId: buttonMsg.id,
+        summary: parsed.summary,
+        parentChannelId: ctx.parentChannelId,
+        parentSessionName: ctx.parentSessionName,
+        parentSessionPort: ctx.parentSessionPort,
+        requesterId: '',
+      })
+    }
+    await editMessage(ctx.threadId, ctx.statusMsgId, '✅ 요약 도착 — 아래에서 검토하세요.').catch(() => {})
     safeRemove(channelId)
     return true
+  }
+
+  function renderActionMessage(opts: {
+    summary: string
+    parentChannelId: string
+    parentSessionName: string
+    mismatchWarning: string
+    status: 'pending' | 'accepted' | 'rejected'
+  }): string {
+    const head =
+      opts.status === 'accepted'
+        ? `✅ **요약 전달됨** → <#${opts.parentChannelId}> (\`${opts.parentSessionName}\`)`
+        : opts.status === 'rejected'
+          ? '❌ **요약 거절됨**'
+          : `📝 **요약** — 검토 후 처리${opts.mismatchWarning}`
+
+    const footer =
+      opts.status === 'pending'
+        ? `\n\n> 수락 시 <#${opts.parentChannelId}> (\`${opts.parentSessionName}\`)의 Claude 세션으로 전달됩니다.`
+        : ''
+
+    return `${head}\n\n${opts.summary}${footer}`
+  }
+
+  function actionRowFor(id: string): ActionRowBuilder<ButtonBuilder> {
+    return new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${SUMMARY_BUTTON_PREFIX}edit:${id}`)
+        .setLabel('수정')
+        .setStyle(ButtonStyle.Secondary)
+        .setEmoji('📝'),
+      new ButtonBuilder()
+        .setCustomId(`${SUMMARY_BUTTON_PREFIX}accept:${id}`)
+        .setLabel('수락')
+        .setStyle(ButtonStyle.Success)
+        .setEmoji('✅'),
+      new ButtonBuilder()
+        .setCustomId(`${SUMMARY_BUTTON_PREFIX}reject:${id}`)
+        .setLabel('거절')
+        .setStyle(ButtonStyle.Danger)
+        .setEmoji('❌'),
+    )
   }
 
   async function handleEphemeralTimeout(name: string, timeoutMs: number): Promise<void> {
@@ -487,6 +586,128 @@ export function createApp(deps: AppDeps) {
     } catch {
       await interaction.reply({ content: 'Failed to relay permission decision.', ephemeral: true } as any)
     }
+  }
+
+  // ── Summary action buttons (Edit / Accept / Reject) ──
+  async function handleSummaryButton(interaction: ButtonInteraction): Promise<void> {
+    const match = /^summary:(accept|edit|reject):(.+)$/.exec(interaction.customId)
+    if (!match) return
+    const action = match[1] as 'accept' | 'edit' | 'reject'
+    const id = match[2]!
+    const ctx = pendingSummaryActions.get(id)
+    if (!ctx) {
+      await interaction
+        .reply({ content: '⚠️ 이 요약은 만료되었어요.', ephemeral: true } as any)
+        .catch(() => {})
+      return
+    }
+
+    if (action === 'edit') {
+      const modal = new ModalBuilder()
+        .setCustomId(`${SUMMARY_MODAL_PREFIX}${id}`)
+        .setTitle('요약 수정')
+      const input = new TextInputBuilder()
+        .setCustomId(SUMMARY_TEXT_INPUT_ID)
+        .setLabel('요약 (수락 시 프로젝트 세션으로 전송)')
+        .setStyle(TextInputStyle.Paragraph)
+        .setValue(ctx.summary.slice(0, SUMMARY_MAX_INPUT_LEN))
+        .setMaxLength(SUMMARY_MAX_INPUT_LEN)
+        .setRequired(true)
+      modal.addComponents(
+        new ActionRowBuilder<TextInputBuilder>().addComponents(input),
+      )
+      await (interaction as any).showModal(modal).catch(() => {})
+      return
+    }
+
+    if (action === 'reject') {
+      pendingSummaryActions.delete(id)
+      await (interaction.message as any)
+        .edit({
+          content: renderActionMessage({
+            summary: ctx.summary,
+            parentChannelId: ctx.parentChannelId,
+            parentSessionName: ctx.parentSessionName,
+            mismatchWarning: '',
+            status: 'rejected',
+          }),
+          components: [],
+        })
+        .catch(() => {})
+      await interaction.deferUpdate().catch(() => {})
+      return
+    }
+
+    // accept
+    pendingSummaryActions.delete(id)
+    const wrapped = `다음은 회의 요약입니다. 이 내용을 바탕으로 작업을 진행해주세요.\n\n${ctx.summary}`
+    let ok = false
+    let errMsg = ''
+    try {
+      const res = await deps.postJSON(deps.sessionUrl(ctx.parentSessionPort, '/message'), {
+        content: wrapped,
+        chat_id: ctx.parentChannelId,
+        message_id: ctx.buttonMsgId,
+        user: 'meeting-summary',
+        user_id: '0',
+        ts: deps.now().toISOString(),
+      })
+      ok = res.ok
+      if (!ok) errMsg = `\`${ctx.parentSessionName}\` 세션이 실행 중인지 확인하세요 (\`!start\`)`
+    } catch (err) {
+      errMsg = err instanceof Error ? err.message : 'unknown'
+    }
+
+    if (ok) {
+      await (interaction.message as any)
+        .edit({
+          content: renderActionMessage({
+            summary: ctx.summary,
+            parentChannelId: ctx.parentChannelId,
+            parentSessionName: ctx.parentSessionName,
+            mismatchWarning: '',
+            status: 'accepted',
+          }),
+          components: [],
+        })
+        .catch(() => {})
+    } else {
+      await (interaction.message as any)
+        .edit({
+          content: `❌ **전송 실패** — ${errMsg}\n\n${ctx.summary}`,
+          components: [],
+        })
+        .catch(() => {})
+    }
+    await interaction.deferUpdate().catch(() => {})
+  }
+
+  // ── Summary edit modal submit ──
+  async function handleSummaryModalSubmit(interaction: ModalSubmitInteraction): Promise<void> {
+    if (!interaction.customId.startsWith(SUMMARY_MODAL_PREFIX)) return
+    const id = interaction.customId.slice(SUMMARY_MODAL_PREFIX.length)
+    const ctx = pendingSummaryActions.get(id)
+    if (!ctx) {
+      await interaction
+        .reply({ content: '⚠️ 이 요약은 만료되었어요.', ephemeral: true } as any)
+        .catch(() => {})
+      return
+    }
+    const newSummary = (interaction.fields as any).getTextInputValue(SUMMARY_TEXT_INPUT_ID) as string
+    ctx.summary = newSummary
+    await ((interaction.message ?? null) as any)
+      ?.edit({
+        content: renderActionMessage({
+          summary: newSummary,
+          parentChannelId: ctx.parentChannelId,
+          parentSessionName: ctx.parentSessionName,
+          mismatchWarning: '',
+          status: 'pending',
+        }),
+        components: [actionRowFor(id)],
+      })
+      .catch(() => {})
+    await interaction.deferUpdate().catch(() => {})
   }
 
   // ── HTTP /reply (from channel.ts) ──
@@ -598,12 +819,15 @@ export function createApp(deps: AppDeps) {
   return {
     pendingPermissions,
     ephemeralSummaries,
+    pendingSummaryActions,
     handleMessage,
     handleCommand,
     handleSummaryCommand,
     handleReply,
     handlePermission,
     handlePermissionButton,
+    handleSummaryButton,
+    handleSummaryModalSubmit,
     tryHandleEphemeralReply,
   }
 }

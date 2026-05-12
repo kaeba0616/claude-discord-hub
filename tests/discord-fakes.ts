@@ -3,7 +3,7 @@
  * bot-app handlers. Each fake records calls so tests can assert behavior.
  */
 
-import type { Message, ButtonInteraction } from 'discord.js'
+import type { Message, ButtonInteraction, ModalSubmitInteraction } from 'discord.js'
 import type { AppDeps, DiscordChannel, SessionEntry } from '../bot-app'
 import type { SessionConfig } from '../config'
 
@@ -193,45 +193,114 @@ export function fakeThread(opts: {
   return thread
 }
 
-// ─── Fake Interaction (button click) ───────────────────────────────────────
+// ─── Fake Interaction (button click + modal submit) ────────────────────────
+
+export interface FakeInteractionMessage {
+  id: string
+  readonly deleted: boolean
+  edits: Array<{ content?: string; components?: unknown[] }>
+  delete(): Promise<void>
+  edit(opts: string | { content?: string; components?: unknown[] }): Promise<void>
+}
+
+function makeFakeInteractionMessage(id: string): FakeInteractionMessage {
+  let deleted = false
+  const edits: Array<{ content?: string; components?: unknown[] }> = []
+  const m: FakeInteractionMessage = {
+    id,
+    get deleted() {
+      return deleted
+    },
+    edits,
+    async delete() {
+      deleted = true
+    },
+    async edit(opts) {
+      if (typeof opts === 'string') edits.push({ content: opts })
+      else edits.push(opts)
+    },
+  }
+  return m
+}
 
 export interface FakeInteraction {
   customId: string
-  message: { id: string; deleted: boolean; delete(): Promise<void> }
+  message: FakeInteractionMessage
   replies: Array<{ content: string; ephemeral?: boolean }>
   deferred: boolean
+  modal: unknown
   reply(opts: { content: string; ephemeral?: boolean }): Promise<void>
   deferUpdate(): Promise<void>
+  showModal(modal: unknown): Promise<void>
   asButtonInteraction(): ButtonInteraction
 }
 
-export function fakeInteraction(customId: string): FakeInteraction {
-  let deleted = false
+export function fakeInteraction(customId: string, messageId = 'btn-msg'): FakeInteraction {
   const replies: Array<{ content: string; ephemeral?: boolean }> = []
+  const message = makeFakeInteractionMessage(messageId)
   const interaction: FakeInteraction = {
     customId,
-    message: {
-      id: 'btn-msg',
-      get deleted() {
-        return deleted
-      },
-      async delete() {
-        deleted = true
-      },
-    },
+    message,
     replies,
     deferred: false,
+    modal: undefined,
     async reply(opts) {
       replies.push(opts)
     },
     async deferUpdate() {
       interaction.deferred = true
     },
+    async showModal(modal) {
+      interaction.modal = modal
+    },
     asButtonInteraction() {
       return interaction as unknown as ButtonInteraction
     },
   }
   return interaction
+}
+
+export interface FakeModalSubmit {
+  customId: string
+  message: FakeInteractionMessage
+  replies: Array<{ content: string; ephemeral?: boolean }>
+  deferred: boolean
+  fields: { getTextInputValue(id: string): string }
+  reply(opts: { content: string; ephemeral?: boolean }): Promise<void>
+  deferUpdate(): Promise<void>
+  asModalSubmit(): ModalSubmitInteraction
+}
+
+export function fakeModalSubmit(opts: {
+  customId: string
+  values: Record<string, string>
+  messageId?: string
+}): FakeModalSubmit {
+  const replies: Array<{ content: string; ephemeral?: boolean }> = []
+  const message = makeFakeInteractionMessage(opts.messageId ?? 'btn-msg')
+  const submit: FakeModalSubmit = {
+    customId: opts.customId,
+    message,
+    replies,
+    deferred: false,
+    fields: {
+      getTextInputValue(id: string): string {
+        const v = opts.values[id]
+        if (v === undefined) throw new Error(`fake modal: no value for ${id}`)
+        return v
+      },
+    },
+    async reply(o) {
+      replies.push(o)
+    },
+    async deferUpdate() {
+      submit.deferred = true
+    },
+    asModalSubmit() {
+      return submit as unknown as ModalSubmitInteraction
+    },
+  }
+  return submit
 }
 
 // ─── Deps factory ──────────────────────────────────────────────────────────

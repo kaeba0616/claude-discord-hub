@@ -13,6 +13,7 @@ import {
   fakeChannel,
   fakeThread,
   fakeInteraction,
+  fakeModalSubmit,
   makeFakeDeps,
   makeSession,
   jsonReq,
@@ -484,12 +485,14 @@ describe('handleSummaryCommand (ephemeral spawn happy path)', () => {
     expect(body.content).toContain('ship the migration')
     expect(body.content).toContain('[bob 09:31]')
     expect(body.content).toContain('[REQUEST_ID=req-uuid]')
-    // 3. Pending entry registered keyed by ephemeral name
+    // 3. Pending entry registered keyed by ephemeral name, parent captured
     expect(app.ephemeralSummaries.get(name)).toMatchObject({
       name,
       port: 9500,
       threadId: 'thread-x',
       requestId: 'req-uuid',
+      parentChannelId: PARENT,
+      parentSessionName: 'proj',
     })
     // 4. Status message edited to "Claude가 요약 중"
     const status = msg.replies[0]
@@ -633,6 +636,9 @@ describe('tryHandleEphemeralReply', () => {
       threadId: 'thread-x',
       statusMsgId: 'status-msg',
       requestId: 'req-ok',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
     })
     const text = '```json\n{"request_id":"req-ok","summary":"## 결정사항\\n- ship it"}\n```'
     const handled = await app.tryHandleEphemeralReply(name, text)
@@ -667,6 +673,9 @@ describe('tryHandleEphemeralReply', () => {
       threadId: 'thread-x',
       statusMsgId: 'status-msg',
       requestId: 'expected-id',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
     })
     const text =
       '```json\n{"request_id":"wrong-id","summary":"contents"}\n```'
@@ -700,6 +709,9 @@ describe('tryHandleEphemeralReply', () => {
       threadId: 'thread-x',
       statusMsgId: 'status-msg',
       requestId: 'r',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
     })
     const handled = await app.tryHandleEphemeralReply(name, 'I refuse to follow the schema, here is prose.')
     expect(handled).toBe(true)
@@ -785,6 +797,9 @@ describe('handleReply HTTP', () => {
       threadId: 'thread-x',
       statusMsgId: 'status-msg',
       requestId: 'r',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
     })
     const replyText = '```json\n{"request_id":"r","summary":"hello"}\n```'
     const res = await app.handleReply(
@@ -905,5 +920,258 @@ describe('handlePermissionButton', () => {
     await app.handlePermissionButton(interaction.asButtonInteraction())
     expect(spy.postCalls).toHaveLength(0)
     expect(interaction.replies).toHaveLength(0)
+  })
+})
+
+// ─── tryHandleEphemeralReply (button posting) ──────────────────────────────
+
+describe('tryHandleEphemeralReply posts buttons + registers action', () => {
+  test('successful summary creates pendingSummaryAction with buttons', async () => {
+    const threadCh = fakeChannel({ id: 'thread-x' })
+    threadCh.messages.stored.set('status-msg', {
+      id: 'status-msg',
+      opts: {},
+      edits: [],
+      async edit(c: string) {
+        this.edits.push(c)
+        return this
+      },
+    } as any)
+    const channels = new Map<string, FakeChannel>([['thread-x', threadCh]])
+    let calls = 0
+    const { deps, spy } = makeFakeDeps({
+      channels,
+      uuid: () => (calls++ === 0 ? 'action-id-1' : 'other'),
+    })
+    const app = createApp(deps)
+    const name = 'ephemeral-aabb'
+    app.ephemeralSummaries.set(name, {
+      name,
+      port: 9500,
+      threadId: 'thread-x',
+      statusMsgId: 'status-msg',
+      requestId: 'req-1',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
+    })
+
+    const text = '```json\n{"request_id":"req-1","summary":"## 결정사항\\n- ship"}\n```'
+    const handled = await app.tryHandleEphemeralReply(name, text)
+    expect(handled).toBe(true)
+
+    // Button message posted in thread
+    expect(threadCh.sent).toHaveLength(1)
+    const sent = threadCh.sent[0]!.opts as any
+    expect(sent.content).toContain('📝 **요약**')
+    expect(sent.content).toContain('## 결정사항')
+    expect(sent.content).toContain('<#parent-ch>')
+    expect(sent.components).toHaveLength(1)
+
+    // Action registered
+    const action = app.pendingSummaryActions.get('action-id-1')
+    expect(action).toMatchObject({
+      id: 'action-id-1',
+      threadId: 'thread-x',
+      summary: '## 결정사항\n- ship',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
+    })
+    expect(action!.buttonMsgId).toBe(threadCh.sent[0]!.id)
+
+    // Status edited + ephemeral session removed
+    expect(spy.scriptCalls).toEqual([`remove ${name}`])
+  })
+})
+
+// ─── handleSummaryButton ───────────────────────────────────────────────────
+
+describe('handleSummaryButton', () => {
+  function seed(app: ReturnType<typeof createApp>, id = 'a1', summary = 'the summary') {
+    app.pendingSummaryActions.set(id, {
+      id,
+      threadId: 'thread-x',
+      buttonMsgId: 'btn-msg',
+      summary,
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
+      requesterId: '',
+    })
+  }
+
+  test('expired action replies ephemerally and does not edit', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const i = fakeInteraction('summary:accept:gone')
+    await app.handleSummaryButton(i.asButtonInteraction())
+    expect(i.replies[0]!.content).toContain('만료')
+    expect(i.replies[0]!.ephemeral).toBe(true)
+    expect(i.message.edits).toHaveLength(0)
+  })
+
+  test('non-summary customId is ignored', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    const i = fakeInteraction('unrelated:click')
+    await app.handleSummaryButton(i.asButtonInteraction())
+    expect(spy.postCalls).toHaveLength(0)
+    expect(i.message.edits).toHaveLength(0)
+  })
+
+  test('accept forwards summary to parent session and edits message', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    seed(app)
+    const i = fakeInteraction('summary:accept:a1')
+    await app.handleSummaryButton(i.asButtonInteraction())
+
+    // POST to parent session
+    expect(spy.postCalls).toHaveLength(1)
+    expect(spy.postCalls[0]!.url).toBe('http://localhost:9200/message')
+    const body = spy.postCalls[0]!.body as any
+    expect(body.chat_id).toBe('parent-ch')
+    expect(body.content).toContain('다음은 회의 요약입니다')
+    expect(body.content).toContain('the summary')
+
+    // Action removed, message edited to "accepted" + buttons stripped
+    expect(app.pendingSummaryActions.has('a1')).toBe(false)
+    expect(i.message.edits).toHaveLength(1)
+    expect(i.message.edits[0]!.content).toContain('✅')
+    expect(i.message.edits[0]!.content).toContain('전달됨')
+    expect(i.message.edits[0]!.components).toEqual([])
+    expect(i.deferred).toBe(true)
+  })
+
+  test('accept handles parent session POST failure', async () => {
+    const { deps } = makeFakeDeps({
+      postJSON: () => ({ ok: false, status: 500 }),
+    })
+    const app = createApp(deps)
+    seed(app)
+    const i = fakeInteraction('summary:accept:a1')
+    await app.handleSummaryButton(i.asButtonInteraction())
+
+    expect(app.pendingSummaryActions.has('a1')).toBe(false)
+    expect(i.message.edits[0]!.content).toContain('전송 실패')
+    expect(i.message.edits[0]!.content).toContain('proj')
+    expect(i.message.edits[0]!.components).toEqual([])
+  })
+
+  test('reject edits message to rejected status with buttons stripped, no POST', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    seed(app)
+    const i = fakeInteraction('summary:reject:a1')
+    await app.handleSummaryButton(i.asButtonInteraction())
+
+    expect(spy.postCalls).toHaveLength(0)
+    expect(app.pendingSummaryActions.has('a1')).toBe(false)
+    expect(i.message.edits[0]!.content).toContain('❌')
+    expect(i.message.edits[0]!.content).toContain('거절')
+    expect(i.message.edits[0]!.components).toEqual([])
+    expect(i.deferred).toBe(true)
+  })
+
+  test('edit shows modal with current summary pre-filled, action stays alive', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    seed(app, 'a1', 'orig summary')
+    const i = fakeInteraction('summary:edit:a1')
+    await app.handleSummaryButton(i.asButtonInteraction())
+
+    // Modal shown, no POST, no message edit, action still pending
+    expect(i.modal).toBeDefined()
+    expect(spy.postCalls).toHaveLength(0)
+    expect(i.message.edits).toHaveLength(0)
+    expect(app.pendingSummaryActions.has('a1')).toBe(true)
+    // The modal carries the action id in customId
+    expect((i.modal as any).data.custom_id).toBe('summary:editmodal:a1')
+  })
+})
+
+// ─── handleSummaryModalSubmit ──────────────────────────────────────────────
+
+describe('handleSummaryModalSubmit', () => {
+  test('updates summary and re-renders message with buttons intact', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    app.pendingSummaryActions.set('a1', {
+      id: 'a1',
+      threadId: 'thread-x',
+      buttonMsgId: 'btn-msg',
+      summary: 'old summary',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
+      requesterId: '',
+    })
+    const submit = fakeModalSubmit({
+      customId: 'summary:editmodal:a1',
+      values: { summary_text: 'new edited summary' },
+    })
+    await app.handleSummaryModalSubmit(submit.asModalSubmit())
+
+    expect(app.pendingSummaryActions.get('a1')!.summary).toBe('new edited summary')
+    expect(submit.message.edits[0]!.content).toContain('new edited summary')
+    expect(submit.message.edits[0]!.content).toContain('📝 **요약**')
+    expect((submit.message.edits[0]!.components as any[])).toHaveLength(1)
+    expect(submit.deferred).toBe(true)
+    expect(spy.postCalls).toHaveLength(0)
+  })
+
+  test('expired modal replies ephemerally', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const submit = fakeModalSubmit({
+      customId: 'summary:editmodal:gone',
+      values: { summary_text: 'x' },
+    })
+    await app.handleSummaryModalSubmit(submit.asModalSubmit())
+    expect(submit.replies[0]!.content).toContain('만료')
+  })
+
+  test('non-summary modal customId is ignored', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const submit = fakeModalSubmit({
+      customId: 'unrelated:modal',
+      values: { summary_text: 'x' },
+    })
+    await app.handleSummaryModalSubmit(submit.asModalSubmit())
+    expect(submit.message.edits).toHaveLength(0)
+    expect(submit.replies).toHaveLength(0)
+  })
+
+  test('after edit, accept forwards the EDITED summary', async () => {
+    const { deps, spy } = makeFakeDeps()
+    const app = createApp(deps)
+    app.pendingSummaryActions.set('a1', {
+      id: 'a1',
+      threadId: 'thread-x',
+      buttonMsgId: 'btn-msg',
+      summary: 'before edit',
+      parentChannelId: 'parent-ch',
+      parentSessionName: 'proj',
+      parentSessionPort: 9200,
+      requesterId: '',
+    })
+    // Edit
+    const submit = fakeModalSubmit({
+      customId: 'summary:editmodal:a1',
+      values: { summary_text: 'after edit' },
+    })
+    await app.handleSummaryModalSubmit(submit.asModalSubmit())
+    // Accept
+    const i = fakeInteraction('summary:accept:a1')
+    await app.handleSummaryButton(i.asButtonInteraction())
+
+    expect(spy.postCalls[0]!.body).toMatchObject({
+      content: expect.stringContaining('after edit'),
+    })
+    expect(spy.postCalls[0]!.body).not.toMatchObject({
+      content: expect.stringContaining('before edit'),
+    })
   })
 })
