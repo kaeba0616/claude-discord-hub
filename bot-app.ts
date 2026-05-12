@@ -48,6 +48,8 @@ export interface AppDeps {
   uuid(): string
   now(): Date
   sleep(ms: number): Promise<void>
+  // Returns QUICKSTART.md contents (or a fallback message). Used by !quickstart.
+  quickstartText(): string
   // Optional overrides (default to the EPHEMERAL_* constants below)
   bootTimeoutMs?: number
   replyTimeoutMs?: number
@@ -86,6 +88,7 @@ export const HELP_TEXT = [
   '`!status` — Show all session statuses',
   '`!list` — List all configured sessions',
   '`!reload` — Reload session configs',
+  '`!quickstart` — Post the quickstart guide in this channel',
   '`!help` — Show this message',
 ].join('\n')
 
@@ -266,6 +269,10 @@ export function createApp(deps: AppDeps) {
       case 'reload': {
         deps.reloadRoutes()
         await msg.reply(`🔄 Routes reloaded. ${deps.routes().size} sessions configured.`)
+        return
+      }
+      case 'quickstart': {
+        await sendChannelMessage(msg.channelId, deps.quickstartText())
         return
       }
       case 'help': {

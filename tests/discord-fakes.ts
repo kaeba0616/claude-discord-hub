@@ -261,6 +261,7 @@ export interface FakeDepsConfig {
   sleep?: (ms: number) => Promise<void>
   bootTimeoutMs?: number
   replyTimeoutMs?: number
+  quickstartText?: () => string
 }
 
 export function makeFakeDeps(cfg: FakeDepsConfig = {}): {
@@ -309,6 +310,7 @@ export function makeFakeDeps(cfg: FakeDepsConfig = {}): {
     sleep: cfg.sleep ?? (ms => new Promise(r => setTimeout(r, ms))),
     bootTimeoutMs: cfg.bootTimeoutMs,
     replyTimeoutMs: cfg.replyTimeoutMs,
+    quickstartText: cfg.quickstartText ?? (() => 'QUICKSTART TEXT (fake)'),
   }
 
   return { deps, spy }

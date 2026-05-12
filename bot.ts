@@ -24,11 +24,13 @@ import { buildRouteMap, loadSessions, findSummarySession } from './config'
 import { createApp, type AppDeps, type DiscordChannel, type SessionEntry } from './bot-app'
 import { loadBotToken } from './config'
 import { execSync } from 'child_process'
+import { readFileSync } from 'fs'
 import { join } from 'path'
 import { homedir } from 'os'
 
 const BOT_PORT = Number(process.env.BOT_PORT ?? 3000)
 const SCRIPT_PATH = join(import.meta.dir, 'claude-sessions.sh')
+const QUICKSTART_PATH = join(import.meta.dir, 'QUICKSTART.md')
 
 // ─── Discord Client ────────────────────────────────────────────────────────
 
@@ -77,6 +79,13 @@ const deps: AppDeps = {
   uuid: () => crypto.randomUUID(),
   now: () => new Date(),
   sleep: ms => new Promise(r => setTimeout(r, ms)),
+  quickstartText: () => {
+    try {
+      return readFileSync(QUICKSTART_PATH, 'utf8')
+    } catch {
+      return 'QUICKSTART.md를 찾을 수 없어요. 레포 루트에 있는지 확인해주세요.'
+    }
+  },
 }
 
 // Sweep any orphan ephemeral-* sessions left over from previous crashes

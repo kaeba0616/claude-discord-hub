@@ -190,6 +190,55 @@ describe('handleCommand', () => {
     expect(msg.replies[0].content).toContain('No previous sessions')
   })
 
+  test('!quickstart sends the quickstart text to the channel', async () => {
+    const ch = fakeChannel({ id: CHANNEL })
+    const channels = new Map([[CHANNEL, ch]])
+    const { deps } = makeFakeDeps({
+      channels,
+      quickstartText: () => '# Quickstart\n\nstep 1',
+    })
+    const app = createApp(deps)
+    const msg = fakeMessage({ content: '!quickstart', channelId: CHANNEL })
+    await app.handleCommand(msg.asDiscordMessage())
+    expect(ch.sent).toHaveLength(1)
+    expect(ch.sent[0].opts.content).toBe('# Quickstart\n\nstep 1')
+  })
+
+  test('!quickstart chunks long content into multiple 2000-char messages', async () => {
+    const ch = fakeChannel({ id: CHANNEL })
+    const channels = new Map([[CHANNEL, ch]])
+    const big = 'a'.repeat(5000)
+    const { deps } = makeFakeDeps({
+      channels,
+      quickstartText: () => big,
+    })
+    const app = createApp(deps)
+    const msg = fakeMessage({ content: '!quickstart', channelId: CHANNEL })
+    await app.handleCommand(msg.asDiscordMessage())
+    expect(ch.sent.length).toBeGreaterThanOrEqual(2)
+    const reassembled = ch.sent.map(s => s.opts.content).join('')
+    expect(reassembled).toBe(big)
+  })
+
+  test('!quickstart works in an unlinked channel too', async () => {
+    const ch = fakeChannel({ id: 'unlinked' })
+    const channels = new Map([['unlinked', ch]])
+    const { deps } = makeFakeDeps({ channels })
+    const app = createApp(deps)
+    const msg = fakeMessage({ content: '!quickstart', channelId: 'unlinked' })
+    await app.handleCommand(msg.asDiscordMessage())
+    expect(ch.sent).toHaveLength(1)
+    expect(ch.sent[0].opts.content).toContain('QUICKSTART')
+  })
+
+  test('!help includes !quickstart in the listing', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const msg = fakeMessage({ content: '!help', channelId: CHANNEL })
+    await app.handleCommand(msg.asDiscordMessage())
+    expect(msg.replies[0].content).toContain('!quickstart')
+  })
+
   test('unknown command suggests !help', async () => {
     const { deps } = makeFakeDeps()
     const app = createApp(deps)
