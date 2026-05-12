@@ -4,7 +4,8 @@
   "private": true,
   "scripts": {
     "bot": "bun bot.ts",
-    "channel": "bun channel.ts"
+    "channel": "bun channel.ts",
+    "test": "bun test"
   },
   "devDependencies": {
     "@types/bun": "latest"
