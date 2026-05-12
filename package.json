@@ -5,7 +5,8 @@
   "scripts": {
     "bot": "bun bot.ts",
     "channel": "bun channel.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "smoke": "bun scripts/smoke.ts"
   },
   "devDependencies": {
     "@types/bun": "latest"
