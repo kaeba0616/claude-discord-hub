@@ -277,18 +277,47 @@ describe('handleMessage forwarding', () => {
   })
 })
 
-// ─── handleSummaryCommand ──────────────────────────────────────────────────
+// ─── handleSummaryCommand (ephemeral) ──────────────────────────────────────
 
-describe('handleSummaryCommand', () => {
+// Common helpers for ephemeral tests
+const PARENT = 'parent-1'
+const TEMPLATE = makeSession({
+  name: 'summarizer',
+  channelId: 'template-ch',
+  port: 9999,
+  isSummary: true,
+  repoPath: '/home/hidi/work/summarizer-workspace',
+})
+
+function makeRoutesWithParent() {
+  return new Map([[PARENT, makeSession({ name: 'proj', channelId: PARENT })]])
+}
+
+function makeThreadWithTranscript(opts?: {
+  parentId?: string | null
+  transcript?: Array<{ id: string; content: string; author: { username: string; bot: boolean }; createdAt: Date }>
+}) {
+  return fakeThread({
+    id: 'thread-x',
+    parentId: opts?.parentId === undefined ? PARENT : opts.parentId,
+    transcript:
+      opts?.transcript ?? [
+        {
+          id: '1',
+          content: 'ship the migration',
+          author: { username: 'alice', bot: false },
+          createdAt: new Date('2026-05-12T09:30:00Z'),
+        },
+      ],
+  })
+}
+
+describe('handleSummaryCommand (refusal paths)', () => {
   test('refuses outside a thread', async () => {
     const { deps } = makeFakeDeps()
     const app = createApp(deps)
     const channel = fakeChannel({ id: CHANNEL })
-    const msg = fakeMessage({
-      content: '!summary',
-      channelId: CHANNEL,
-      channel,
-    })
+    const msg = fakeMessage({ content: '!summary', channelId: CHANNEL, channel })
     await app.handleSummaryCommand(msg.asDiscordMessage())
     expect(msg.replies[0].content).toContain('스레드 안에서만')
   })
@@ -296,51 +325,40 @@ describe('handleSummaryCommand', () => {
   test('refuses when thread parent is not linked', async () => {
     const { deps } = makeFakeDeps()
     const app = createApp(deps)
-    const thread = fakeThread({ parentId: 'orphan-parent' })
-    const msg = fakeMessage({ content: '!summary', channelId: 'thread-1', channel: thread })
+    const thread = makeThreadWithTranscript({ parentId: 'orphan-parent' })
+    const msg = fakeMessage({ content: '!summary', channelId: 'thread-x', channel: thread })
     await app.handleSummaryCommand(msg.asDiscordMessage())
     expect(msg.replies[0].content).toContain('연결되어 있지 않아요')
   })
 
   test('refuses when parent channel is the summarizer itself', async () => {
-    const parent = 'parent-1'
     const routes = new Map([
-      [parent, makeSession({ name: 'summarizer', channelId: parent, isSummary: true })],
+      [PARENT, makeSession({ name: 'summarizer', channelId: PARENT, isSummary: true })],
     ])
     const { deps } = makeFakeDeps({ routes })
     const app = createApp(deps)
-    const thread = fakeThread({ parentId: parent })
-    const msg = fakeMessage({ content: '!summary', channelId: 'thread-1', channel: thread })
+    const thread = makeThreadWithTranscript()
+    const msg = fakeMessage({ content: '!summary', channelId: 'thread-x', channel: thread })
     await app.handleSummaryCommand(msg.asDiscordMessage())
     expect(msg.replies[0].content).toContain('요약 전용 세션')
   })
 
-  test('refuses when no summary session is configured', async () => {
-    const parent = 'parent-1'
-    const routes = new Map([[parent, makeSession({ name: 'proj', channelId: parent })]])
-    const { deps } = makeFakeDeps({ routes })
+  test('refuses when summarizer template is not configured', async () => {
+    const { deps } = makeFakeDeps({ routes: makeRoutesWithParent() })
     const app = createApp(deps)
-    const thread = fakeThread({ parentId: parent })
-    const msg = fakeMessage({ content: '!summary', channelId: 'thread-1', channel: thread })
+    const thread = makeThreadWithTranscript()
+    const msg = fakeMessage({ content: '!summary', channelId: 'thread-x', channel: thread })
     await app.handleSummaryCommand(msg.asDiscordMessage())
-    expect(msg.replies[0].content).toContain('요약 세션이 설정되지')
+    expect(msg.replies[0].content).toContain('summarizer 템플릿')
   })
 
   test('refuses when transcript has no user messages', async () => {
-    const parent = 'parent-1'
-    const routes = new Map([[parent, makeSession({ name: 'proj', channelId: parent })]])
-    const { deps } = makeFakeDeps({
-      routes,
-      summarySession: makeSession({
-        name: 'summarizer',
-        channelId: 'sum-ch',
-        port: 9999,
-        isSummary: true,
-      }),
+    const { deps, spy } = makeFakeDeps({
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
     })
     const app = createApp(deps)
-    const thread = fakeThread({
-      parentId: parent,
+    const thread = makeThreadWithTranscript({
       transcript: [
         {
           id: '1',
@@ -356,33 +374,32 @@ describe('handleSummaryCommand', () => {
         },
       ],
     })
-    const msg = fakeMessage({ content: '!summary', channelId: 'thread-1', channel: thread })
+    const msg = fakeMessage({ content: '!summary', channelId: 'thread-x', channel: thread })
     await app.handleSummaryCommand(msg.asDiscordMessage())
     expect(msg.replies[0].content).toContain('요약할 내용이 없어요')
+    expect(spy.scriptCalls).toHaveLength(0) // no spawn attempted
   })
+})
 
-  test('happy path posts transcript to summarizer and registers pending', async () => {
-    const parent = 'parent-1'
-    const routes = new Map([[parent, makeSession({ name: 'proj', channelId: parent })]])
-    const summarizer = makeSession({
-      name: 'summarizer',
-      channelId: 'sum-ch',
-      port: 9999,
-      isSummary: true,
-    })
+describe('handleSummaryCommand (ephemeral spawn happy path)', () => {
+  test('spawns ephemeral, posts transcript, registers pending', async () => {
+    let uuidCounter = 0
+    const uuids = ['e1f2a3b4c5d6e7f8', 'req-uuid']
     const { deps, spy } = makeFakeDeps({
-      routes,
-      summarySession: summarizer,
-      uuid: () => 'uuid-abc',
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
+      readSessionConf: name =>
+        name.startsWith('ephemeral-')
+          ? makeSession({ name, channelId: name, port: 9500, repoPath: TEMPLATE.repoPath })
+          : undefined,
+      uuid: () => uuids[uuidCounter++ % uuids.length]!,
     })
     const app = createApp(deps)
-    const thread = fakeThread({
-      id: 'thread-x',
-      parentId: parent,
+    const thread = makeThreadWithTranscript({
       transcript: [
         {
           id: '1',
-          content: 'let us ship the thing',
+          content: 'ship the migration',
           author: { username: 'alice', bot: false },
           createdAt: new Date('2026-05-12T09:30:00Z'),
         },
@@ -400,132 +417,154 @@ describe('handleSummaryCommand', () => {
       channel: thread,
       author: { id: 'u-1', username: 'alice' },
     })
+
     await app.handleSummaryCommand(msg.asDiscordMessage())
 
-    // Status message posted
-    expect(msg.replies[0].content).toContain('요약 중')
-    // POST to summarizer
+    const name = 'ephemeral-e1f2a3b4'
+    // 1. Script: add + start
+    expect(spy.scriptCalls).toEqual([
+      `add ${name} ${TEMPLATE.repoPath} ${name}`,
+      `start ${name}`,
+    ])
+    // 2. transcript POSTed to the bridge port returned by readSessionConf
     expect(spy.postCalls).toHaveLength(1)
-    expect(spy.postCalls[0].url).toBe('http://localhost:9999/message')
+    expect(spy.postCalls[0].url).toBe('http://localhost:9500/message')
     const body = spy.postCalls[0].body as any
-    expect(body.chat_id).toBe('sum-ch')
+    expect(body.chat_id).toBe(name)
     expect(body.content).toContain('[alice 09:30]')
-    expect(body.content).toContain('let us ship the thing')
+    expect(body.content).toContain('ship the migration')
     expect(body.content).toContain('[bob 09:31]')
-    expect(body.content).toContain('[REQUEST_ID=uuid-abc]')
-
-    // pendingSummaries populated
-    expect(app.pendingSummaries.get('uuid-abc')).toMatchObject({
+    expect(body.content).toContain('[REQUEST_ID=req-uuid]')
+    // 3. Pending entry registered keyed by ephemeral name
+    expect(app.ephemeralSummaries.get(name)).toMatchObject({
+      name,
+      port: 9500,
       threadId: 'thread-x',
-      sessionName: 'proj',
+      requestId: 'req-uuid',
     })
-  })
+    // 4. Status message edited to "Claude가 요약 중"
+    const status = msg.replies[0]
+    expect(status.edits.at(-1)).toContain('요약 중')
 
-  test('edits status message and clears pending when summarizer is unreachable', async () => {
-    const parent = 'parent-1'
-    const routes = new Map([[parent, makeSession({ name: 'proj', channelId: parent })]])
-    const { deps } = makeFakeDeps({
-      routes,
-      summarySession: makeSession({
-        name: 'summarizer',
-        channelId: 'sum-ch',
-        port: 9999,
-        isSummary: true,
-      }),
-      postJSON: () => ({ ok: false, status: 500 }),
-      uuid: () => 'uuid-fail',
-    })
-    const app = createApp(deps)
-    const thread = fakeThread({
-      parentId: parent,
-      transcript: [
-        {
-          id: '1',
-          content: 'hi',
-          author: { username: 'alice', bot: false },
-          createdAt: new Date(),
-        },
-      ],
-    })
-    const msg = fakeMessage({ content: '!summary', channelId: 'thread-1', channel: thread })
-    await app.handleSummaryCommand(msg.asDiscordMessage())
-    expect(msg.replies[0].edits.at(-1)).toContain('요약 세션이 응답하지')
-    expect(app.pendingSummaries.has('uuid-fail')).toBe(false)
+    // Cleanup the running timeout to avoid leaking into other tests
+    const ctx = app.ephemeralSummaries.get(name)!
+    if (ctx.timeoutHandle) clearTimeout(ctx.timeoutHandle)
   })
 })
 
-// ─── tryHandleSummaryReply & forwardSummaryToSession ───────────────────────
-
-describe('summary reply parsing + forwarding', () => {
-  test('parses JSON inside fenced code block and forwards to target session', async () => {
-    const target = makeSession({
-      name: 'proj',
-      channelId: 'target-ch',
-      port: 9200,
-    })
-    const channels = new Map<string, FakeChannel>([
-      ['thread-x', fakeChannel({ id: 'thread-x' })],
-      ['target-ch', fakeChannel({ id: 'target-ch' })],
-    ])
+describe('handleSummaryCommand (failure paths cleanup)', () => {
+  test('removes ephemeral when bridge never becomes healthy', async () => {
     const { deps, spy } = makeFakeDeps({
-      channels,
-      sessions: [target],
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
+      readSessionConf: name =>
+        makeSession({ name, channelId: name, port: 9500, repoPath: TEMPLATE.repoPath }),
+      bridgeHealthy: () => false,
+      sleep: () => Promise.resolve(),
+      bootTimeoutMs: 50,
+      uuid: () => 'aaaaaaaa',
     })
     const app = createApp(deps)
-    // Pre-seed the pending summary
-    app.pendingSummaries.set('req-1', {
-      threadId: 'thread-x',
-      requesterId: 'user-1',
-      statusMsgId: 'status-msg',
-      sessionName: 'proj',
+    const msg = fakeMessage({
+      content: '!summary',
+      channelId: 'thread-x',
+      channel: makeThreadWithTranscript(),
     })
-    // Also stash a "status" message inside the thread channel so editStatus works
-    const threadCh = channels.get('thread-x')!
-    threadCh.messages.stored.set('status-msg', {
-      id: 'status-msg',
-      opts: { content: '🔄 요약 중...' },
-      edits: [],
-      async edit(content: string) {
-        this.edits.push(content)
-        return this
-      },
-    } as any)
-
-    const replyText = '```json\n{"request_id":"req-1","summary":"## 결정사항\\n- ship"}\n```'
-    const handled = await app.tryHandleSummaryReply(replyText)
-    expect(handled).toBe(true)
-    expect(app.pendingSummaries.has('req-1')).toBe(false)
-
-    // Allow the fire-and-forget forwardSummaryToSession to complete
-    await new Promise(r => setTimeout(r, 20))
-
-    // Forwarded to target session
-    const fwd = spy.postCalls.find(c => c.url === 'http://localhost:9200/message')
-    expect(fwd).toBeDefined()
-    expect((fwd!.body as any).content).toContain('## 결정사항')
-    expect((fwd!.body as any).chat_id).toBe('target-ch')
-
-    // Summary echoed to thread
-    expect(threadCh.sent[0].opts.content).toContain('📝 **요약**')
-    // Status message edited to success
-    const statusMsg = threadCh.messages.stored.get('status-msg')!
-    expect(statusMsg.edits.at(-1)).toContain('✅')
+    await app.handleSummaryCommand(msg.asDiscordMessage())
+    const name = 'ephemeral-aaaaaaaa'
+    expect(spy.scriptCalls).toEqual([
+      `add ${name} ${TEMPLATE.repoPath} ${name}`,
+      `start ${name}`,
+      `remove ${name}`,
+    ])
+    expect(spy.postCalls).toHaveLength(0)
+    expect(app.ephemeralSummaries.has(name)).toBe(false)
+    expect(msg.replies[0].edits.at(-1)).toContain('부팅되지 않았')
   })
 
-  test('returns false for non-JSON, unknown request_id, or missing fields', async () => {
+  test('removes ephemeral when readSessionConf returns nothing', async () => {
+    const { deps, spy } = makeFakeDeps({
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
+      readSessionConf: () => undefined,
+      uuid: () => 'bbbbbbbb',
+    })
+    const app = createApp(deps)
+    const msg = fakeMessage({
+      content: '!summary',
+      channelId: 'thread-x',
+      channel: makeThreadWithTranscript(),
+    })
+    await app.handleSummaryCommand(msg.asDiscordMessage())
+    expect(spy.scriptCalls).toContain(`remove ephemeral-bbbbbbbb`)
+    expect(msg.replies[0].edits.at(-1)).toContain('conf를 읽지')
+  })
+
+  test('removes ephemeral when bridge POST fails', async () => {
+    const { deps, spy } = makeFakeDeps({
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
+      readSessionConf: name =>
+        makeSession({ name, channelId: name, port: 9500, repoPath: TEMPLATE.repoPath }),
+      bridgeHealthy: () => true,
+      sleep: () => Promise.resolve(),
+      postJSON: () => ({ ok: false, status: 500 }),
+      uuid: () => 'cccccccc',
+    })
+    const app = createApp(deps)
+    const msg = fakeMessage({
+      content: '!summary',
+      channelId: 'thread-x',
+      channel: makeThreadWithTranscript(),
+    })
+    await app.handleSummaryCommand(msg.asDiscordMessage())
+    const name = 'ephemeral-cccccccc'
+    expect(spy.scriptCalls.at(-1)).toBe(`remove ${name}`)
+    expect(app.ephemeralSummaries.has(name)).toBe(false)
+    expect(msg.replies[0].edits.at(-1)).toContain('transcript를 받지')
+  })
+
+  test('removes ephemeral when add script throws', async () => {
+    const { deps, spy } = makeFakeDeps({
+      routes: makeRoutesWithParent(),
+      summarySession: TEMPLATE,
+      runScript: args => {
+        if (args.startsWith('add ')) throw new Error('disk full')
+        return ''
+      },
+      uuid: () => 'dddddddd',
+    })
+    const app = createApp(deps)
+    const msg = fakeMessage({
+      content: '!summary',
+      channelId: 'thread-x',
+      channel: makeThreadWithTranscript(),
+    })
+    await app.handleSummaryCommand(msg.asDiscordMessage())
+    expect(spy.scriptCalls).toContain('remove ephemeral-dddddddd')
+    expect(msg.replies[0].edits.at(-1)).toContain('spawn 실패')
+  })
+})
+
+describe('tryHandleEphemeralReply', () => {
+  test('returns false when channel_id is not ephemeral', async () => {
     const { deps } = makeFakeDeps()
     const app = createApp(deps)
-    expect(await app.tryHandleSummaryReply('no json here')).toBe(false)
-    expect(await app.tryHandleSummaryReply('```json\n{"hello":"world"}\n```')).toBe(false)
-    expect(
-      await app.tryHandleSummaryReply(
-        '```json\n{"request_id":"missing","summary":"x"}\n```',
-      ),
-    ).toBe(false)
+    const handled = await app.tryHandleEphemeralReply('normal-channel', 'hello')
+    expect(handled).toBe(false)
   })
 
-  test('forwardSummaryToSession reports error when target session vanished', async () => {
-    const channels = new Map<string, FakeChannel>([['thread-x', fakeChannel({ id: 'thread-x' })]])
+  test('returns false when no pending entry for that ephemeral', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const handled = await app.tryHandleEphemeralReply('ephemeral-unknown', 'whatever')
+    expect(handled).toBe(false)
+  })
+
+  test('parses JSON, posts summary to thread, edits status, removes session', async () => {
+    const channels = new Map<string, FakeChannel>([
+      ['thread-x', fakeChannel({ id: 'thread-x' })],
+    ])
     const threadCh = channels.get('thread-x')!
     threadCh.messages.stored.set('status-msg', {
       id: 'status-msg',
@@ -536,15 +575,88 @@ describe('summary reply parsing + forwarding', () => {
         return this
       },
     } as any)
-    const { deps } = makeFakeDeps({ channels, sessions: [] })
+    const { deps, spy } = makeFakeDeps({ channels })
     const app = createApp(deps)
-    await app.forwardSummaryToSession('summary', {
+    const name = 'ephemeral-zzzzzzzz'
+    app.ephemeralSummaries.set(name, {
+      name,
+      port: 9500,
       threadId: 'thread-x',
       statusMsgId: 'status-msg',
-      sessionName: 'gone',
+      requestId: 'req-ok',
     })
-    const statusMsg = threadCh.messages.stored.get('status-msg')!
-    expect(statusMsg.edits.at(-1)).toContain('사라졌어요')
+    const text = '```json\n{"request_id":"req-ok","summary":"## 결정사항\\n- ship it"}\n```'
+    const handled = await app.tryHandleEphemeralReply(name, text)
+    expect(handled).toBe(true)
+    expect(app.ephemeralSummaries.has(name)).toBe(false)
+    expect(spy.scriptCalls).toEqual([`remove ${name}`])
+    expect(threadCh.sent[0].opts.content).toContain('📝 **요약**')
+    expect(threadCh.sent[0].opts.content).toContain('## 결정사항')
+    expect(threadCh.messages.stored.get('status-msg')!.edits.at(-1)).toContain('✅')
+  })
+
+  test('flags request_id mismatch but still posts summary and cleans up', async () => {
+    const channels = new Map<string, FakeChannel>([
+      ['thread-x', fakeChannel({ id: 'thread-x' })],
+    ])
+    const threadCh = channels.get('thread-x')!
+    threadCh.messages.stored.set('status-msg', {
+      id: 'status-msg',
+      opts: {},
+      edits: [],
+      async edit(content: string) {
+        this.edits.push(content)
+        return this
+      },
+    } as any)
+    const { deps, spy } = makeFakeDeps({ channels })
+    const app = createApp(deps)
+    const name = 'ephemeral-mismatch'
+    app.ephemeralSummaries.set(name, {
+      name,
+      port: 9500,
+      threadId: 'thread-x',
+      statusMsgId: 'status-msg',
+      requestId: 'expected-id',
+    })
+    const text =
+      '```json\n{"request_id":"wrong-id","summary":"contents"}\n```'
+    const handled = await app.tryHandleEphemeralReply(name, text)
+    expect(handled).toBe(true)
+    expect(threadCh.sent[0].opts.content).toContain('mismatch')
+    expect(threadCh.sent[0].opts.content).toContain('contents')
+    expect(spy.scriptCalls).toEqual([`remove ${name}`])
+  })
+
+  test('falls back to raw paste + cleans up when JSON parse fails', async () => {
+    const channels = new Map<string, FakeChannel>([
+      ['thread-x', fakeChannel({ id: 'thread-x' })],
+    ])
+    const threadCh = channels.get('thread-x')!
+    threadCh.messages.stored.set('status-msg', {
+      id: 'status-msg',
+      opts: {},
+      edits: [],
+      async edit(content: string) {
+        this.edits.push(content)
+        return this
+      },
+    } as any)
+    const { deps, spy } = makeFakeDeps({ channels })
+    const app = createApp(deps)
+    const name = 'ephemeral-badjson'
+    app.ephemeralSummaries.set(name, {
+      name,
+      port: 9500,
+      threadId: 'thread-x',
+      statusMsgId: 'status-msg',
+      requestId: 'r',
+    })
+    const handled = await app.tryHandleEphemeralReply(name, 'I refuse to follow the schema, here is prose.')
+    expect(handled).toBe(true)
+    expect(threadCh.messages.stored.get('status-msg')!.edits.at(-1)).toContain('파싱 실패')
+    expect(threadCh.sent[0].opts.content).toContain('Raw 응답')
+    expect(spy.scriptCalls).toEqual([`remove ${name}`])
   })
 })
 
@@ -603,39 +715,45 @@ describe('handleReply HTTP', () => {
     expect(res.status).toBe(404)
   })
 
-  test('intercepts reply on summary channel and does NOT send to discord', async () => {
-    const summaryCh = 'sum-ch'
-    const target = makeSession({ name: 'proj', channelId: 'target', port: 9200 })
-    const targetChannel = fakeChannel({ id: 'target' })
-    const channels = new Map<string, FakeChannel>([
-      ['target', targetChannel],
-      [summaryCh, fakeChannel({ id: summaryCh })],
-    ])
-    const { deps } = makeFakeDeps({
-      channels,
-      summarySession: makeSession({
-        name: 'summarizer',
-        channelId: summaryCh,
-        port: 9999,
-        isSummary: true,
-      }),
-      sessions: [target],
-    })
+  test('intercepts reply on ephemeral channel_id and never hits a real channel', async () => {
+    const threadCh = fakeChannel({ id: 'thread-x' })
+    threadCh.messages.stored.set('status-msg', {
+      id: 'status-msg',
+      opts: {},
+      edits: [],
+      async edit(content: string) {
+        this.edits.push(content)
+        return this
+      },
+    } as any)
+    const channels = new Map<string, FakeChannel>([['thread-x', threadCh]])
+    const { deps } = makeFakeDeps({ channels })
     const app = createApp(deps)
-    app.pendingSummaries.set('req-x', {
-      threadId: 'thread-1',
-      requesterId: 'u',
-      statusMsgId: 's',
-      sessionName: 'proj',
+    const name = 'ephemeral-12345678'
+    app.ephemeralSummaries.set(name, {
+      name,
+      port: 9500,
+      threadId: 'thread-x',
+      statusMsgId: 'status-msg',
+      requestId: 'r',
     })
-    const replyText = '```json\n{"request_id":"req-x","summary":"hello"}\n```'
+    const replyText = '```json\n{"request_id":"r","summary":"hello"}\n```'
     const res = await app.handleReply(
-      jsonReq('http://x/reply', { channel_id: summaryCh, text: replyText }),
+      jsonReq('http://x/reply', { channel_id: name, text: replyText }),
     )
     const body = (await res.json()) as any
     expect(body.intercepted).toBe(true)
-    // summarizer channel itself should not have been "send"-ed to
-    expect(channels.get(summaryCh)!.sent).toHaveLength(0)
+    // The summary should land in the THREAD, not anywhere else
+    expect(threadCh.sent[0].opts.content).toContain('hello')
+  })
+
+  test('returns 404 on ephemeral channel_id with no pending entry', async () => {
+    const { deps } = makeFakeDeps()
+    const app = createApp(deps)
+    const res = await app.handleReply(
+      jsonReq('http://x/reply', { channel_id: 'ephemeral-noone', text: 'x' }),
+    )
+    expect(res.status).toBe(404)
   })
 })
 

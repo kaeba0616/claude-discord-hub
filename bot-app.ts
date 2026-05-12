@@ -38,13 +38,19 @@ export interface AppDeps {
   reloadRoutes(): void
   findSummarySession(): SessionConfig | undefined
   loadSessions(): SessionConfig[]
+  readSessionConf(name: string): SessionConfig | undefined
   runScript(args: string, timeoutMs?: number): string
   listRecentSessions(repoPath: string, limit: number): SessionEntry[]
   postJSON(url: string, body: unknown): Promise<Response>
   sessionUrl(port: number, path: string): string
+  bridgeHealthy(port: number): Promise<boolean>
   fetchChannel(id: string): Promise<DiscordChannel | null>
   uuid(): string
   now(): Date
+  sleep(ms: number): Promise<void>
+  // Optional overrides (default to the EPHEMERAL_* constants below)
+  bootTimeoutMs?: number
+  replyTimeoutMs?: number
 }
 
 export interface PendingPermission {
@@ -52,12 +58,18 @@ export interface PendingPermission {
   port: number
 }
 
-export interface PendingSummary {
+export interface EphemeralSummary {
+  name: string
+  port: number
   threadId: string
-  requesterId: string
   statusMsgId: string
-  sessionName: string
+  requestId: string
+  timeoutHandle?: ReturnType<typeof setTimeout>
 }
+
+export const EPHEMERAL_PREFIX = 'ephemeral-'
+export const EPHEMERAL_BOOT_TIMEOUT_MS = 30_000
+export const EPHEMERAL_REPLY_TIMEOUT_MS = 90_000
 
 export const NOT_LINKED = '❌ This channel is not linked to a session.'
 
@@ -70,7 +82,7 @@ export const HELP_TEXT = [
   '`!last` — Show the most recent session',
   '`!sessions` — List recent 5 sessions',
   '`!resume` — Continue the most recent session (`claude -c`)',
-  '`!summary` — (in a thread) Summarize the meeting and forward to this channel\'s session',
+  '`!summary` — (in a thread) Spin up a one-shot summarizer session and post the summary in this thread',
   '`!status` — Show all session statuses',
   '`!list` — List all configured sessions',
   '`!reload` — Reload session configs',
@@ -86,7 +98,7 @@ interface SummaryReply {
 
 export function createApp(deps: AppDeps) {
   const pendingPermissions = new Map<string, PendingPermission>()
-  const pendingSummaries = new Map<string, PendingSummary>()
+  const ephemeralSummaries = new Map<string, EphemeralSummary>()
 
   // ── messageCreate entry point ──
   async function handleMessage(msg: Message): Promise<void> {
@@ -265,7 +277,7 @@ export function createApp(deps: AppDeps) {
     }
   }
 
-  // ── !summary (in a thread) ──
+  // ── !summary (in a thread, one-shot ephemeral session) ──
   async function handleSummaryCommand(msg: Message): Promise<void> {
     const channel = msg.channel as any
     if (!channel.isThread || !channel.isThread()) {
@@ -278,21 +290,23 @@ export function createApp(deps: AppDeps) {
       await msg.reply('❌ 이 스레드의 상위 채널을 찾을 수 없어요.')
       return
     }
-    const target = deps.routes().get(parentId)
-    if (!target) {
+    const parent = deps.routes().get(parentId)
+    if (!parent) {
       await msg.reply(
         `❌ 이 스레드가 속한 채널 <#${parentId}>은(는) 어떤 세션과도 연결되어 있지 않아요. \`!add\`로 먼저 세션을 등록하세요.`,
       )
       return
     }
-    if (target.isSummary) {
+    if (parent.isSummary) {
       await msg.reply('❌ 요약 전용 세션 채널에서는 `!summary`를 사용할 수 없어요.')
       return
     }
 
-    const summarizer = deps.findSummarySession()
-    if (!summarizer) {
-      await msg.reply('❌ 요약 세션이 설정되지 않았어요.')
+    const template = deps.findSummarySession()
+    if (!template) {
+      await msg.reply(
+        '❌ summarizer 템플릿 세션이 설정되지 않았어요. (`claude-sessions.sh add summarizer <repo> <ch> summary`)',
+      )
       return
     }
 
@@ -310,88 +324,137 @@ export function createApp(deps: AppDeps) {
       return
     }
 
+    const ephemeralName = `${EPHEMERAL_PREFIX}${deps.uuid().replace(/-/g, '').slice(0, 8)}`
     const requestId = deps.uuid()
-    const status = (await msg.reply(`🔄 요약 중... (\`${target.name}\`로 전송 예정)`)) as any
+    const status = (await msg.reply(
+      `🔄 임시 요약 세션 부팅 중... (\`${ephemeralName}\`)`,
+    )) as any
+    const editStatus = (content: string) =>
+      (status.edit ? status.edit(content) : Promise.resolve()).catch(() => {})
 
-    pendingSummaries.set(requestId, {
-      threadId: channel.id,
-      requesterId: msg.author.id,
-      statusMsgId: status.id,
-      sessionName: target.name,
-    })
-
+    let registered = false
     try {
-      const res = await deps.postJSON(deps.sessionUrl(summarizer.port, '/message'), {
+      deps.runScript(`add ${ephemeralName} ${template.repoPath} ${ephemeralName}`, 5000)
+      const conf = deps.readSessionConf(ephemeralName)
+      if (!conf) {
+        await editStatus('❌ 임시 세션 conf를 읽지 못했어요.')
+        safeRemove(ephemeralName)
+        return
+      }
+      deps.runScript(`start ${ephemeralName}`, 15000)
+
+      const bootMs = deps.bootTimeoutMs ?? EPHEMERAL_BOOT_TIMEOUT_MS
+      const ready = await waitForBridge(conf.port, bootMs)
+      if (!ready) {
+        await editStatus(`❌ 임시 세션이 ${bootMs / 1000}s 안에 부팅되지 않았어요.`)
+        safeRemove(ephemeralName)
+        return
+      }
+      await editStatus('📝 transcript 전송 → Claude가 요약 중...')
+
+      const replyMs = deps.replyTimeoutMs ?? EPHEMERAL_REPLY_TIMEOUT_MS
+      const timeoutHandle = setTimeout(() => {
+        void handleEphemeralTimeout(ephemeralName, replyMs)
+      }, replyMs)
+      ephemeralSummaries.set(ephemeralName, {
+        name: ephemeralName,
+        port: conf.port,
+        threadId: channel.id,
+        statusMsgId: status.id,
+        requestId,
+        timeoutHandle,
+      })
+      registered = true
+
+      const res = await deps.postJSON(deps.sessionUrl(conf.port, '/message'), {
         content: buildSummaryPrompt(requestId, transcriptLines.join('\n')),
-        chat_id: summarizer.channelId,
+        chat_id: ephemeralName,
         message_id: msg.id,
         user: msg.author.username,
         user_id: msg.author.id,
         ts: deps.now().toISOString(),
       })
       if (!res.ok) {
-        pendingSummaries.delete(requestId)
-        await status.edit('❌ 요약 세션이 응답하지 않아요. `!start`로 시작하세요.').catch(() => {})
+        clearTimeout(timeoutHandle)
+        ephemeralSummaries.delete(ephemeralName)
+        registered = false
+        await editStatus('❌ 임시 세션이 transcript를 받지 못했어요.')
+        safeRemove(ephemeralName)
       }
-    } catch {
-      pendingSummaries.delete(requestId)
-      await status.edit('❌ 요약 세션에 연결할 수 없어요.').catch(() => {})
+    } catch (err) {
+      if (registered) {
+        const ctx = ephemeralSummaries.get(ephemeralName)
+        if (ctx?.timeoutHandle) clearTimeout(ctx.timeoutHandle)
+        ephemeralSummaries.delete(ephemeralName)
+      }
+      await editStatus(
+        `❌ 임시 세션 spawn 실패: ${err instanceof Error ? err.message : 'unknown'}`,
+      )
+      safeRemove(ephemeralName)
     }
   }
 
-  // Try to interpret an incoming /reply text as a summary JSON. Returns true if
-  // it matched a known pending request_id and was dispatched.
-  async function tryHandleSummaryReply(text: string): Promise<boolean> {
-    const m = /```json\s*([\s\S]*?)\s*```/.exec(text) ?? /(\{[\s\S]*\})/.exec(text)
-    if (!m) return false
-    let parsed: SummaryReply
-    try {
-      parsed = JSON.parse(m[1]) as SummaryReply
-    } catch {
-      return false
-    }
-    if (!parsed.request_id || !parsed.summary) return false
-    const ctx = pendingSummaries.get(parsed.request_id)
+  // Inbound /reply for an ephemeral session — parse JSON, post summary to
+  // thread, tear down the session. Returns true if intercepted.
+  async function tryHandleEphemeralReply(channelId: string, text: string): Promise<boolean> {
+    if (!channelId.startsWith(EPHEMERAL_PREFIX)) return false
+    const ctx = ephemeralSummaries.get(channelId)
     if (!ctx) return false
-    pendingSummaries.delete(parsed.request_id)
-    void forwardSummaryToSession(parsed.summary, ctx)
+
+    if (ctx.timeoutHandle) clearTimeout(ctx.timeoutHandle)
+    ephemeralSummaries.delete(channelId)
+
+    const m = /```json\s*([\s\S]*?)\s*```/.exec(text) ?? /(\{[\s\S]*\})/.exec(text)
+    let parsed: SummaryReply | undefined
+    if (m) {
+      try {
+        parsed = JSON.parse(m[1]) as SummaryReply
+      } catch {}
+    }
+
+    if (parsed?.summary) {
+      const header =
+        parsed.request_id === ctx.requestId
+          ? '📝 **요약**'
+          : '⚠️ **요약** (request_id mismatch — 신뢰성 낮음)'
+      await sendChannelMessage(ctx.threadId, `${header}\n\n${parsed.summary}`).catch(() => {})
+      await editMessage(ctx.threadId, ctx.statusMsgId, '✅ 요약 완료').catch(() => {})
+    } else {
+      await editMessage(ctx.threadId, ctx.statusMsgId, '❌ Claude 응답 파싱 실패').catch(() => {})
+      await sendChannelMessage(
+        ctx.threadId,
+        `**Raw 응답:**\n\`\`\`\n${text.slice(0, 1500)}\n\`\`\``,
+      ).catch(() => {})
+    }
+    safeRemove(channelId)
     return true
   }
 
-  async function forwardSummaryToSession(
-    summary: string,
-    ctx: { threadId: string; statusMsgId: string; sessionName: string },
-  ): Promise<void> {
-    const editStatus = (content: string) => editMessage(ctx.threadId, ctx.statusMsgId, content)
+  async function handleEphemeralTimeout(name: string, timeoutMs: number): Promise<void> {
+    const ctx = ephemeralSummaries.get(name)
+    if (!ctx) return
+    ephemeralSummaries.delete(name)
+    await editMessage(
+      ctx.threadId,
+      ctx.statusMsgId,
+      `❌ Claude 응답 타임아웃 (${timeoutMs / 1000}s)`,
+    ).catch(() => {})
+    safeRemove(name)
+  }
 
-    const target = deps.loadSessions().find(s => s.name === ctx.sessionName)
-    if (!target) {
-      await editStatus(`❌ 세션 \`${ctx.sessionName}\`이(가) 사라졌어요.`)
-      return
+  async function waitForBridge(port: number, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (await deps.bridgeHealthy(port)) return true
+      await deps.sleep(500)
     }
+    return false
+  }
 
-    await sendChannelMessage(ctx.threadId, `📝 **요약**\n\n${summary}`).catch(() => {})
-
-    const wrapped = `다음은 회의 요약입니다. 이 내용을 바탕으로 작업을 진행해주세요.\n\n${summary}`
+  function safeRemove(name: string): void {
     try {
-      const res = await deps.postJSON(deps.sessionUrl(target.port, '/message'), {
-        content: wrapped,
-        chat_id: target.channelId,
-        message_id: ctx.statusMsgId,
-        user: 'meeting-summary',
-        user_id: '0',
-        ts: deps.now().toISOString(),
-      })
-      if (!res.ok) {
-        await editStatus(
-          `❌ 세션 \`${ctx.sessionName}\`에 전송 실패. 세션이 실행 중인지 확인하세요 (\`!start\`).`,
-        )
-        return
-      }
-      await editStatus(`✅ 요약을 \`${ctx.sessionName}\` (<#${target.channelId}>)로 전송했어요.`)
-    } catch (err) {
-      await editStatus(`❌ 전송 실패: ${err instanceof Error ? err.message : 'unknown'}`)
-    }
+      deps.runScript(`remove ${name}`, 10000)
+    } catch {}
   }
 
   // ── Button interaction (permission relay click) ──
@@ -427,10 +490,14 @@ export function createApp(deps: AppDeps) {
       reply_to?: string
     }
 
-    const summary = deps.findSummarySession()
-    if (summary && json.channel_id === summary.channelId) {
-      const handled = await tryHandleSummaryReply(json.text)
+    // Ephemeral summarizer reply — intercept and never post to a real channel.
+    if (json.channel_id.startsWith(EPHEMERAL_PREFIX)) {
+      const handled = await tryHandleEphemeralReply(json.channel_id, json.text)
       if (handled) return jsonResponse({ ok: true, intercepted: true })
+      return jsonResponse(
+        { ok: false, error: 'no pending ephemeral session' },
+        404,
+      )
     }
 
     try {
@@ -523,15 +590,14 @@ export function createApp(deps: AppDeps) {
 
   return {
     pendingPermissions,
-    pendingSummaries,
+    ephemeralSummaries,
     handleMessage,
     handleCommand,
     handleSummaryCommand,
     handleReply,
     handlePermission,
     handlePermissionButton,
-    tryHandleSummaryReply,
-    forwardSummaryToSession,
+    tryHandleEphemeralReply,
   }
 }
 

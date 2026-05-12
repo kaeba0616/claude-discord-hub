@@ -63,18 +63,24 @@ const deps: AppDeps = {
   reloadRoutes,
   findSummarySession,
   loadSessions,
+  readSessionConf: name => loadSessions().find(s => s.name === name),
   runScript: (args, timeoutMs = 10_000) =>
     execSync(`${SCRIPT_PATH} ${args}`, { encoding: 'utf8', timeout: timeoutMs }),
   listRecentSessions,
   postJSON,
   sessionUrl: (port, path) => `http://localhost:${port}${path}`,
+  bridgeHealthy,
   fetchChannel: async id => {
     const ch = await client.channels.fetch(id)
     return (ch as unknown as DiscordChannel | null) ?? null
   },
   uuid: () => crypto.randomUUID(),
   now: () => new Date(),
+  sleep: ms => new Promise(r => setTimeout(r, ms)),
 }
+
+// Sweep any orphan ephemeral-* sessions left over from previous crashes
+sweepEphemeralOrphans()
 
 const app = createApp(deps)
 
@@ -118,6 +124,31 @@ function postJSON(url: string, body: unknown): Promise<Response> {
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
   })
+}
+
+async function bridgeHealthy(port: number): Promise<boolean> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 1_000)
+    const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal })
+    clearTimeout(timer)
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
+function sweepEphemeralOrphans(): void {
+  const orphans = loadSessions().filter(s => s.name.startsWith('ephemeral-'))
+  if (orphans.length === 0) return
+  console.log(`Sweeping ${orphans.length} orphan ephemeral session(s) from previous run`)
+  for (const o of orphans) {
+    try {
+      execSync(`${SCRIPT_PATH} remove ${o.name}`, { encoding: 'utf8', timeout: 10_000 })
+    } catch (err) {
+      console.warn(`  failed to remove ${o.name}:`, err instanceof Error ? err.message : err)
+    }
+  }
 }
 
 function projectSessionsDir(repoPath: string): string {

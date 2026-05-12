@@ -255,6 +255,12 @@ export interface FakeDepsConfig {
   listRecentSessions?: (repoPath: string, limit: number) => SessionEntry[]
   uuid?: () => string
   now?: () => Date
+  // For ephemeral spawn flow:
+  readSessionConf?: (name: string) => SessionConfig | undefined
+  bridgeHealthy?: (port: number) => boolean | Promise<boolean>
+  sleep?: (ms: number) => Promise<void>
+  bootTimeoutMs?: number
+  replyTimeoutMs?: number
 }
 
 export function makeFakeDeps(cfg: FakeDepsConfig = {}): {
@@ -272,6 +278,8 @@ export function makeFakeDeps(cfg: FakeDepsConfig = {}): {
     },
     findSummarySession: () => cfg.summarySession,
     loadSessions: () => cfg.sessions ?? [],
+    readSessionConf: name =>
+      cfg.readSessionConf ? cfg.readSessionConf(name) : (cfg.sessions ?? []).find(s => s.name === name),
     runScript: (args, _timeoutMs) => {
       spy.scriptCalls.push(args)
       return cfg.runScript ? cfg.runScript(args) : ''
@@ -291,9 +299,16 @@ export function makeFakeDeps(cfg: FakeDepsConfig = {}): {
       return res
     },
     sessionUrl: (port, path) => `http://localhost:${port}${path}`,
+    bridgeHealthy: async port => {
+      if (!cfg.bridgeHealthy) return true
+      return await cfg.bridgeHealthy(port)
+    },
     fetchChannel: async id => channels.get(id) ?? null,
     uuid: cfg.uuid ?? (() => 'test-uuid-1'),
     now: cfg.now ?? (() => new Date('2026-05-12T00:00:00.000Z')),
+    sleep: cfg.sleep ?? (ms => new Promise(r => setTimeout(r, ms))),
+    bootTimeoutMs: cfg.bootTimeoutMs,
+    replyTimeoutMs: cfg.replyTimeoutMs,
   }
 
   return { deps, spy }

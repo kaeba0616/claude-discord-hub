@@ -109,28 +109,30 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 !resume            # 마지막 대화 이어서 시작 (claude -c)
 ```
 
-### 회의 요약 → 프로젝트 세션에 전달
+### 회의 요약 → 스레드에 게시 (one-shot ephemeral 세션)
 
-각 프로젝트 채널에서 회의를 thread로 만들고, `!summary`로 회의 내용을 요약해 그 채널의 Claude 세션으로 전달할 수 있습니다.
+각 프로젝트 채널에서 회의를 thread로 만들고 `!summary`를 치면, 봇이 **매번 임시 Claude 세션을 띄워 요약하고 종료**합니다. 여러 프로젝트 간 context 오염 없음, 매 요청은 fresh context로 격리.
 
-**사전 설정 (최초 1회):** 요약 전용 Claude 세션이 필요합니다.
+**사전 설정 (최초 1회):** 요약 워크스페이스 등록. summarizer.conf는 이제 **template**으로만 쓰입니다 (repo_path 출처). 실제로 띄워둘 필요 없음.
 
 ```bash
-# 디스코드에 요약 전용 채널 만들고 ID 복사 후
-./claude-sessions.sh add summarizer ~/work/summarizer-workspace <SUMMARY_CH_ID> summary
-./claude-sessions.sh start summarizer
+# 디스코드에 더미 채널 만들고 ID 복사 후 (실제로는 사용 안 됨)
+./claude-sessions.sh add summarizer ~/work/summarizer-workspace <DUMMY_CH_ID> summary
+# 시작하지 않습니다 — 봇이 !summary 때마다 임시로 spawn함
 ```
 
-요약 세션의 워크스페이스(`~/work/summarizer-workspace/CLAUDE.md`)에 "회의 transcript를 받으면 정해진 JSON 스키마로만 응답하라"는 시스템 프롬프트를 넣어두세요. (이 레포의 예시 참고)
+요약 워크스페이스(`~/work/summarizer-workspace/CLAUDE.md`)에 "transcript를 받으면 정해진 JSON 스키마로만 응답하라"는 지시를 넣어두세요 (이 레포의 예시 참고).
 
 **사용:**
 1. 프로젝트 채널 (예: `#myproject`, 이미 `!add`로 세션 연결된 채널) 안에서 메시지 우클릭 → **스레드 만들기**
 2. 스레드에서 회의 진행
 3. 스레드에서 `!summary` 입력
 4. 봇이:
-   - 요약 세션에 transcript를 전달 → JSON으로 한국어 요약 받음
-   - 요약본을 스레드에 게시 (회의록)
-   - 그 채널의 프로젝트 Claude에 요약을 forwarding → Claude가 요약대로 작업 진행
+   - `ephemeral-<uuid>` 임시 세션 spawn (tmux + claude + MCP bridge)
+   - transcript 전송 → JSON으로 한국어 요약 받음
+   - 스레드에 요약 게시
+   - 임시 세션 자동 종료 + conf 정리
+5. 부팅 ~10초 + 요약 시간 포함 보통 15–30초 소요
 
 ### 전체 시작/중지
 
@@ -150,7 +152,7 @@ Discord에서 봇이 온라인으로 표시되면 성공.
 | `!resume` | 마지막 대화 이어서 (`claude -c`) |
 | `!last` | 가장 최근 세션 |
 | `!sessions` | 최근 5개 세션 목록 |
-| `!summary` | (스레드에서) 회의 요약 → 상위 채널 세션에 전달 |
+| `!summary` | (스레드에서) 임시 세션 spawn → 회의 요약 → 스레드 게시 → 세션 종료 |
 | `!status` | 모든 세션 상태 |
 | `!list` | 등록된 세션 목록 |
 | `!reload` | 설정 새로고침 |
@@ -214,4 +216,5 @@ claude-sessions.sh   # 매니저 스크립트
 | 봇이 메시지를 무시 | Developer Portal > Bot > **Message Content Intent** 활성화 확인 |
 | 세션 시작 안 됨 | `tmux attach -t claude-<name>`으로 직접 확인 |
 | `!add` 실패 | 레포 경로가 서버의 절대경로 또는 `~/` 경로인지 확인 |
-| `!summary` "요약 세션이 설정되지 않았어요" | 위 "회의 요약" 섹션의 사전 설정 단계 수행 |
+| `!summary` "summarizer 템플릿이 설정되지 않았어요" | 위 "회의 요약" 섹션의 사전 설정 단계 수행 |
+| `!summary` 부팅 타임아웃 (30s) | summarizer 워크스페이스 경로/CLAUDE.md 확인, `tmux ls`로 좀비 세션 확인 |
